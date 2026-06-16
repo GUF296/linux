@@ -805,12 +805,6 @@ static int audioreach_widget_load_buffer(struct snd_soc_component *component,
 	case MODULE_ID_DATA_LOGGING:
 		audioreach_widget_log_module_load(mod, mod_array);
 		break;
-	case MODULE_ID_SAL:
-	case MODULE_ID_Y700_PRE_TDM:
-	case MODULE_ID_SPLITTER:
-	case MODULE_ID_AW_RX:
-	case MODULE_ID_AW_COPP:
-		break;
 	case MODULE_ID_I2S_SINK:
 	case MODULE_ID_I2S_SOURCE:
 	case MODULE_ID_TDM_SINK:
@@ -1121,14 +1115,6 @@ static void audioreach_connect_sub_graphs(struct q6apm *apm,
 	info = idr_find(&apm->graph_info_idr, m2->graph_id);
 	mutex_unlock(&apm->lock);
 
-	if (!info) {
-		dev_err(apm->dev,
-			"AudioReach mixer graph %u missing: src=0x%x dst=0x%x connect=%d\n",
-			m2->graph_id, m1->module_instance_id, m2->module_instance_id,
-			connect);
-		return;
-	}
-
 	if (connect) {
 		info->src_mod_inst_id = m1->module_instance_id;
 		info->src_mod_op_port_id = 1;
@@ -1152,9 +1138,6 @@ static bool audioreach_is_vmixer_connected(struct q6apm *apm,
 	mutex_lock(&apm->lock);
 	info = idr_find(&apm->graph_info_idr, m2->graph_id);
 	mutex_unlock(&apm->lock);
-
-	if (!info)
-		return false;
 
 	if (info->dst_mod_inst_id == m2->module_instance_id &&
 	    info->src_mod_inst_id == m1->module_instance_id)

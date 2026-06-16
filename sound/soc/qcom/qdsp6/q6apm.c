@@ -42,7 +42,7 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 {
 	struct audioreach_graph_info *info;
 	struct audioreach_graph *graph;
-	int id, ret;
+	int id;
 
 	mutex_lock(&apm->lock);
 	graph = idr_find(&apm->graph_idr, graph_id);
@@ -87,16 +87,7 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 
 	kref_init(&graph->refcount);
 
-	dev_info(apm->dev,
-		 "Y700 AR graph open send: graph=%u subgraphs=%u src=0x%x/%u dst=0x%x/%u\n",
-		 graph_id, info->num_sub_graphs, info->src_mod_inst_id,
-		 info->src_mod_op_port_id, info->dst_mod_inst_id,
-		 info->dst_mod_ip_port_id);
-
-	ret = q6apm_send_cmd_sync(apm, graph->graph, 0);
-	dev_info(apm->dev,
-		 "Y700 AR graph open done: graph=%u ret=%d dsp_status=0x%x\n",
-		 graph_id, ret, apm->result.status);
+	q6apm_send_cmd_sync(apm, graph->graph, 0);
 
 	return graph;
 }
@@ -110,7 +101,6 @@ static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t op
 	struct audioreach_sub_graph *sg;
 	struct q6apm *apm = graph->apm;
 	int i = 0, payload_size = APM_GRAPH_MGMT_PSIZE(mgmt_cmd, num_sub_graphs);
-	int ret;
 
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(payload_size, opcode, 0);
 	if (IS_ERR(pkt))
@@ -128,17 +118,7 @@ static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t op
 	list_for_each_entry(sg, &info->sg_list, node)
 		mgmt_cmd->sub_graph_id_list[i++] = sg->sub_graph_id;
 
-	dev_info(apm->dev,
-		 "Y700 AR graph mgmt send: graph=%u opcode=0x%08x subgraphs=%d first_sg=%u\n",
-		 info->id, opcode, num_sub_graphs,
-		 num_sub_graphs ? mgmt_cmd->sub_graph_id_list[0] : 0);
-
-	ret = q6apm_send_cmd_sync(apm, pkt, 0);
-	dev_info(apm->dev,
-		 "Y700 AR graph mgmt done: graph=%u opcode=0x%08x ret=%d dsp_status=0x%x\n",
-		 info->id, opcode, ret, apm->result.status);
-
-	return ret;
+	return q6apm_send_cmd_sync(apm, pkt, 0);
 }
 
 static void q6apm_put_audioreach_graph(struct kref *ref)
@@ -205,7 +185,6 @@ int q6apm_graph_media_format_shmem(struct q6apm_graph *graph,
 				   struct audioreach_module_config *cfg)
 {
 	struct audioreach_module *module;
-	int rc;
 
 	if (cfg->direction == SNDRV_PCM_STREAM_CAPTURE)
 		module = q6apm_find_module_by_mid(graph, MODULE_ID_RD_SHARED_MEM_EP);
@@ -215,14 +194,7 @@ int q6apm_graph_media_format_shmem(struct q6apm_graph *graph,
 	if (!module)
 		return -ENODEV;
 
-	rc = audioreach_set_media_format(graph, module, cfg);
-	dev_info(graph->dev,
-		 "Y700 SHMEM set_media: graph=%u module=0x%x iid=0x%x dir=%d rate=%u ch=%u bw=%u fmt=0x%x rc=%d\n",
-		 graph->id, module->module_id, module->instance_id,
-		 cfg->direction, cfg->sample_rate, cfg->num_channels,
-		 cfg->bit_width, cfg->fmt, rc);
-	if (rc)
-		return rc;
+	audioreach_set_media_format(graph, module, cfg);
 
 	return 0;
 
@@ -427,7 +399,6 @@ int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_mo
 	struct audioreach_sub_graph *sgs;
 	struct audioreach_container *container;
 	struct audioreach_module *module;
-	int rc;
 
 	list_for_each_entry(sgs, &info->sg_list, node) {
 		list_for_each_entry(container, &sgs->container_list, node) {
@@ -436,17 +407,7 @@ int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_mo
 					(module->module_id == MODULE_ID_RD_SHARED_MEM_EP))
 					continue;
 
-				rc = audioreach_set_media_format(graph, module, cfg);
-				if (graph->id == 40 || rc)
-					dev_info(graph->dev,
-						 "Y700 AR set_media: graph=%u module=0x%x iid=0x%x cfg rate=%u ch=%u bw=%u fmt=0x%x fsf=%u sd_mask=0x%x rc=%d\n",
-						 graph->id, module->module_id,
-						 module->instance_id, cfg->sample_rate,
-						 cfg->num_channels, cfg->bit_width,
-						 cfg->fmt, cfg->frame_size_factor,
-						 cfg->sd_line_mask, rc);
-				if (rc)
-					return rc;
+				audioreach_set_media_format(graph, module, cfg);
 			}
 		}
 	}

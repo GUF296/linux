@@ -87,15 +87,19 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	channels->min = 2;
 	channels->max = 2;
 	switch (cpu_dai->id) {
-	case SECONDARY_MI2S_RX:
 	case SECONDARY_TDM_RX_0:
 		/*
-		 * Y700's external smart PAs are wired to the secondary TDM
-		 * interface. Android exposes the speaker backend as 48 kHz,
-		 * 8-channel audio carried in 8 x 32-bit TDM slots; only the
-		 * active slot placement is narrowed separately by the TDM slot
-		 * mask below.
+		 * Android AudioFlinger feeds the speaker path as 48 kHz stereo
+		 * S24, while the AW2308s are configured for an 8-slot/32-bit TDM
+		 * frame and consume slot0/slot1. Keep PCM channels stereo and
+		 * express the physical frame through set_tdm_slot().
 		 */
+		snd_mask_none(fmt);
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S24_LE);
+		channels->min = 2;
+		channels->max = 2;
+		break;
+	case SECONDARY_MI2S_RX:
 		snd_mask_none(fmt);
 		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);
 		channels->min = 8;
@@ -137,6 +141,20 @@ static int sc8280xp_tdm_snd_hw_params(struct snd_pcm_substream *substream,
 	}
 
 	channels = params_channels(params);
+	if (cpu_dai->id == SECONDARY_MI2S_RX) {
+		ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0, 0x3,
+					       NUM_TDM_SLOTS, 32);
+		if (ret < 0)
+			return ret;
+
+		return snd_soc_dai_set_channel_map(cpu_dai, 0, NULL,
+						   NUM_TDM_SLOTS,
+						   tdm_slot_offset);
+	}
+
+	if (cpu_dai->id == SECONDARY_TDM_RX_0)
+		slot_width = 32;
+
 	ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0, 0x3,
 				       NUM_TDM_SLOTS, slot_width);
 	if (ret < 0)
@@ -175,17 +193,30 @@ static int sc8280xp_snd_startup(struct snd_pcm_substream *substream)
 		if (ret < 0)
 			return ret;
 
+		ret = snd_soc_dai_set_sysclk(cpu_dai,
+					     Q6AFE_LPASS_CLK_ID_SEC_TDM_IBIT,
+					     TDM_BCLK_RATE,
+					     SNDRV_PCM_STREAM_PLAYBACK);
+		if (ret < 0 && ret != -ENOTSUPP)
+			return ret;
+
 		for_each_rtd_codec_dais(rtd, i, codec_dai) {
 			ret = snd_soc_dai_set_fmt(codec_dai,
 						  SND_SOC_DAIFMT_BC_FC |
-						  SND_SOC_DAIFMT_NB_NF |
-						  SND_SOC_DAIFMT_DSP_A);
+						  SND_SOC_DAIFMT_IB_NF |
+						  SND_SOC_DAIFMT_DSP_B);
 			if (ret < 0 && ret != -ENOTSUPP)
 				return ret;
 
 			ret = snd_soc_dai_set_sysclk(codec_dai, 0,
 						     TDM_BCLK_RATE,
 						     SNDRV_PCM_STREAM_PLAYBACK);
+			if (ret < 0 && ret != -ENOTSUPP)
+				return ret;
+
+			ret = snd_soc_dai_set_tdm_slot(codec_dai, 0,
+						       BIT(i),
+						       NUM_TDM_SLOTS, 32);
 			if (ret < 0 && ret != -ENOTSUPP)
 				return ret;
 		}

@@ -2,7 +2,6 @@
 // Copyright (c) 2020, Linaro Limited
 
 #include <linux/kernel.h>
-#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/soc/qcom/apr.h>
 #include <sound/soc.h>
@@ -12,82 +11,6 @@
 #include <dt-bindings/soc/qcom,gpr.h>
 #include "q6apm.h"
 #include "audioreach.h"
-
-/*
- * Y700 daily AudioReach endpoint defaults.
- *
- * -1 keeps the normal topology/runtime-derived value. Non-negative values are
- * the accepted Y700-specific payload fields that are still needed for the
- * daily route.
- */
-static const int y700_i2s_lpaif_type = -1;
-
-static const int y700_i2s_intf_idx = -1;
-
-static const int y700_i2s_sd_line_idx = -1;
-
-static const int y700_i2s_ws_src = -1;
-
-static const int y700_i2s_frame_size_factor = -1;
-
-static const int y700_mfc_force_rate = -1;
-
-static const int y700_mfc_force_channels = -1;
-
-static const int y700_mfc_force_bit_width = -1;
-
-static const int y700_tdm_lpaif_type = -1;
-
-static const int y700_tdm_intf_idx = -1;
-
-static const int y700_tdm_sync_src = -1;
-
-static const int y700_tdm_ctrl_data_oe = -1;
-
-static const int y700_tdm_slot_mask = -1;
-
-static const int y700_tdm_nslots = -1;
-
-static const int y700_tdm_slot_width = -1;
-
-static const int y700_tdm_sync_mode = -1;
-
-static const int y700_tdm_invert_sync = -1;
-
-static const int y700_tdm_sync_delay = -1;
-
-static const int y700_tdm_lane_mask = -1;
-
-static const int y700_tdm_frame_size_factor = -1;
-
-static const int y700_tdm_media_rate = -1;
-
-static const int y700_tdm_media_channels = -1;
-
-static const int y700_tdm_media_bit_width = -1;
-
-/*
- * Bit mask for TDM endpoint params:
- *   bit0 MF, bit1 FSF, bit2 INTF, bit3 LANE, bit4 CLK, bit5 POWER, bit6 DMA_ALIGN.
- * Default keeps the current known path: MF + FSF + INTF + LANE + CLK.
- */
-static const int y700_tdm_cfg_mask = 0x1f;
-
-static const int y700_tdm_combined_setcfg;
-
-static const int y700_tdm_clk_attr = -1;
-
-static const int y700_tdm_clk_root = -1;
-
-static const int y700_tdm_clk_freq = -1;
-
-static const int y700_tdm_power_mode = -1;
-
-static const int y700_tdm_dma_align = -1;
-
-static const int y700_spr_delay_path_end_iid = 0x4023;
-
-static const int y700_spr_delay_path_graph = 0;
 
 /* SubGraph Config */
 struct apm_sub_graph_data {
@@ -266,14 +189,6 @@ struct apm_module_hw_intf_clk_cfg {
 
 #define APM_HW_INTF_CLK_CFG_PSIZE \
 	ALIGN(sizeof(struct apm_module_hw_intf_clk_cfg), 8)
-
-struct apm_module_spr_delay_path_end_cfg {
-	struct apm_module_param_data param_data;
-	uint32_t module_instance_id;
-} __packed;
-
-#define APM_SPR_DELAY_PATH_END_CFG_PSIZE \
-	ALIGN(sizeof(struct apm_module_spr_delay_path_end_cfg), 8)
 
 struct apm_module_hw_ep_power_mode_cfg {
 	struct apm_module_param_data param_data;
@@ -793,8 +708,7 @@ static int audioreach_display_port_set_media_format(struct q6apm_graph *graph,
 	param_data->error_code = 0;
 	param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
 	param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
-	fs_cfg->frame_size_factor = cfg->frame_size_factor ?:
-				    module->frame_size_factor ?: 1;
+	fs_cfg->frame_size_factor = 1;
 	p += fs_sz;
 
 	intf_cfg = p;
@@ -853,8 +767,7 @@ static int audioreach_codec_dma_set_media_format(struct q6apm_graph *graph,
 	param_data->error_code = 0;
 	param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
 	param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
-	fs_cfg->frame_size_factor = cfg->frame_size_factor ?:
-				    module->frame_size_factor ?: 1;
+	fs_cfg->frame_size_factor = 1;
 	p += fs_sz;
 
 	intf_cfg = p;
@@ -963,21 +876,11 @@ static int audioreach_mfc_set_media_format(struct q6apm_graph *graph,
 	struct apm_module_param_data *param_data;
 	struct param_id_mfc_media_format *media_format;
 	uint32_t num_channels = cfg->num_channels;
-	uint32_t sample_rate = cfg->sample_rate;
-	uint16_t bit_width = cfg->bit_width;
-	int payload_size;
+	uint32_t bit_width = cfg->bit_width;
+	int payload_size = APM_MFC_CFG_PSIZE(media_format, num_channels) +
+				APM_MODULE_PARAM_DATA_SIZE;
 	int i;
 	void *p;
-
-	if (y700_mfc_force_channels > 0)
-		num_channels = y700_mfc_force_channels;
-	if (y700_mfc_force_rate > 0)
-		sample_rate = y700_mfc_force_rate;
-	if (y700_mfc_force_bit_width > 0)
-		bit_width = y700_mfc_force_bit_width;
-
-	payload_size = APM_MFC_CFG_PSIZE(media_format, num_channels) +
-		       APM_MODULE_PARAM_DATA_SIZE;
 
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(payload_size, APM_CMD_SET_CFG, 0);
 	if (IS_ERR(pkt))
@@ -993,26 +896,11 @@ static int audioreach_mfc_set_media_format(struct q6apm_graph *graph,
 	p = p + APM_MODULE_PARAM_DATA_SIZE;
 	media_format = p;
 
-	media_format->sample_rate = sample_rate;
+	media_format->sample_rate = cfg->sample_rate;
 	media_format->bit_width = bit_width;
 	media_format->num_channels = num_channels;
-	for (i = 0; i < num_channels; i++) {
-		if (y700_mfc_force_channels > 0)
-			media_format->channel_mapping[i] = i + 1;
-		else
-			media_format->channel_mapping[i] = cfg->channel_map[i];
-	}
-
-	if (y700_mfc_force_rate > 0 || y700_mfc_force_channels > 0 ||
-	    y700_mfc_force_bit_width > 0)
-		dev_info(graph->dev,
-			 "Y700 AR MFC media: graph=%u iid=0x%x rate=%u ch=%u bw=%u cfg rate=%u ch=%u bw=%u force rate=%d ch=%d bw=%d\n",
-			 graph->id, module->instance_id,
-			 media_format->sample_rate, media_format->num_channels,
-			 media_format->bit_width, cfg->sample_rate,
-			 cfg->num_channels, cfg->bit_width,
-			 y700_mfc_force_rate, y700_mfc_force_channels,
-			 y700_mfc_force_bit_width);
+	for (i = 0; i < num_channels; i++)
+		media_format->channel_mapping[i] = cfg->channel_map[i];
 
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
@@ -1129,68 +1017,210 @@ static int audioreach_i2s_set_media_format(struct q6apm_graph *graph,
 					   const struct audioreach_module *module,
 					   const struct audioreach_module_config *cfg)
 {
-	struct apm_module_frame_size_factor_cfg *fs_cfg;
-	struct apm_module_param_data *param_data;
-	struct apm_i2s_module_intf_cfg *intf_cfg;
-	struct apm_module_hw_ep_mf_cfg *hw_cfg;
 	int ic_sz = APM_I2S_INTF_CFG_PSIZE;
 	int ep_sz = APM_HW_EP_CFG_PSIZE;
 	int fs_sz = APM_FS_CFG_PSIZE;
-	int size = ic_sz + ep_sz + fs_sz;
-	void *p;
-	int ret;
+	int clk_sz = APM_HW_INTF_CLK_CFG_PSIZE;
+	u32 frame_size_factor = cfg->frame_size_factor ?:
+				module->frame_size_factor ?: 1;
+	u32 y700_hw_interface_type = module->hw_interface_type;
+	u32 y700_hw_interface_idx = module->hw_interface_idx;
+	u32 y700_sd_line_idx = module->sd_line_idx;
+	u32 y700_ws_src = module->ws_src;
+	u32 y700_intf_ws_src = y700_ws_src;
+	bool y700_graph40_i2s_sink =
+		graph->id == 40 && module->module_id == MODULE_ID_I2S_SINK;
+	int rc;
 
-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
+	/*
+	 * Y700 AW speakers: current graph40 accepts the historical
+	 * lpaif=1, idx=0 addressing. Canonical lpaif=0, idx=1 was tested
+	 * and rejected by DSP with GRAPH_START 1001002.
+	 */
+	if (y700_graph40_i2s_sink) {
+		y700_hw_interface_type = 1;
+		y700_hw_interface_idx = 0;
+		y700_sd_line_idx = I2S_8CHS;
+		y700_intf_ws_src = CONFIG_I2S_WS_SRC_INTERNAL;
+	}
+
+	{
+		struct apm_module_param_data *param_data;
+		struct apm_i2s_module_intf_cfg *intf_cfg;
+		void *p;
+
+		struct gpr_pkt *pkt __free(kfree) =
+			audioreach_alloc_apm_cmd_pkt(ic_sz, APM_CMD_SET_CFG, 0);
+		if (IS_ERR(pkt))
+			return PTR_ERR(pkt);
+
+		p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+		intf_cfg = p;
+
+		param_data = &intf_cfg->param_data;
+		param_data->module_instance_id = module->instance_id;
+		param_data->error_code = 0;
+		param_data->param_id = PARAM_ID_I2S_INTF_CFG;
+		param_data->param_size = ic_sz - APM_MODULE_PARAM_DATA_SIZE;
+
+		intf_cfg->cfg.lpaif_type = y700_hw_interface_type;
+		intf_cfg->cfg.intf_idx = y700_hw_interface_idx;
+		intf_cfg->cfg.sd_line_idx = y700_sd_line_idx;
+
+		switch (cfg->fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+		case SND_SOC_DAIFMT_BP_FP:
+			intf_cfg->cfg.ws_src = CONFIG_I2S_WS_SRC_INTERNAL;
+			break;
+		case SND_SOC_DAIFMT_BC_FC:
+			/* CPU is slave */
+			intf_cfg->cfg.ws_src = CONFIG_I2S_WS_SRC_EXTERNAL;
+			break;
+		default:
+			intf_cfg->cfg.ws_src = y700_ws_src;
+			break;
+		}
+
+			if (y700_graph40_i2s_sink)
+				intf_cfg->cfg.ws_src = y700_intf_ws_src;
+
+			rc = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+			if (rc)
+				return rc;
+	}
+
+	{
+		struct apm_module_hw_ep_mf_cfg *hw_cfg;
+		struct apm_module_param_data *param_data;
+		void *p;
+
+		struct gpr_pkt *pkt __free(kfree) =
+			audioreach_alloc_apm_cmd_pkt(ep_sz, APM_CMD_SET_CFG, 0);
+		if (IS_ERR(pkt))
+			return PTR_ERR(pkt);
+
+		p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+		hw_cfg = p;
+		param_data = &hw_cfg->param_data;
+		param_data->module_instance_id = module->instance_id;
+		param_data->error_code = 0;
+		param_data->param_id = PARAM_ID_HW_EP_MF_CFG;
+		param_data->param_size = ep_sz - APM_MODULE_PARAM_DATA_SIZE;
+
+			hw_cfg->mf.sample_rate = cfg->sample_rate;
+			hw_cfg->mf.bit_width = cfg->bit_width;
+			hw_cfg->mf.num_channels = cfg->num_channels;
+			hw_cfg->mf.data_format = module->data_format;
+
+			rc = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+			if (rc)
+				return rc;
+	}
+
+	if (1) {
+		struct apm_module_hw_intf_clk_cfg *clk_cfg;
+		struct apm_module_param_data *param_data;
+		u32 slot_width = cfg->bit_width == 24 ? 32 : cfg->bit_width;
+		u32 clock_freq = cfg->sample_rate * cfg->num_channels * slot_width;
+		u32 clock_id;
+		void *p;
+
+		/*
+		 * Y700 AW speakers: effective stream format is stereo S16, but the
+		 * physical secondary 2-data-line frame is 8 x 32-bit at 48 kHz
+		 * (12.288 MHz BCLK). Keep this physical clock independent from the
+		 * media-format channels so graph40 can test Android's group stream
+		 * semantics without dropping the bus clock.
+		 */
+		if (y700_graph40_i2s_sink) {
+			slot_width = 32;
+			clock_freq = 12288000;
+		}
+
+		struct gpr_pkt *pkt __free(kfree) =
+			audioreach_alloc_apm_cmd_pkt(clk_sz, APM_CMD_SET_CFG, 0);
+		if (IS_ERR(pkt))
+			return PTR_ERR(pkt);
+
+		switch (y700_hw_interface_idx) {
+		case I2S_INTF_TYPE_PRIMARY:
+			clock_id = CLOCK_ID_PRI_I2S_IBIT;
+			break;
+		case I2S_INTF_TYPE_SECONDARY:
+			clock_id = CLOCK_ID_SEC_I2S_IBIT;
+			break;
+		case I2S_INTF_TYPE_TERTIARY:
+			clock_id = CLOCK_ID_TER_I2S_IBIT;
+			break;
+		case I2S_INTF_TYPE_QUATERNARY:
+			clock_id = CLOCK_ID_QUAD_I2S_IBIT;
+			break;
+		case I2S_INTF_TYPE_QUINARY:
+			clock_id = CLOCK_ID_QUI_I2S_IBIT;
+			break;
+		default:
+			clock_id = CLOCK_ID_SEC_I2S_IBIT;
+			break;
+		}
+
+		if (y700_graph40_i2s_sink)
+			clock_id = CLOCK_ID_SEC_I2S_IBIT;
+
+		p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+		clk_cfg = p;
+		param_data = &clk_cfg->param_data;
+		param_data->module_instance_id = module->instance_id;
+		param_data->error_code = 0;
+		param_data->param_id = PARAM_ID_HW_INTF_CLK_CFG;
+		param_data->param_size = clk_sz - APM_MODULE_PARAM_DATA_SIZE;
+
+		clk_cfg->cfg.clock_id = clock_id;
+		clk_cfg->cfg.clock_freq = clock_freq;
+		clk_cfg->cfg.clock_attri = CLOCK_ATTRIBUTE_COUPLE_NO;
+		clk_cfg->cfg.clock_root = CLOCK_ROOT_DEFAULT;
+
+			rc = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+			if (rc)
+				return rc;
+	}
+
+	{
+		struct apm_module_frame_size_factor_cfg *fs_cfg;
+		struct apm_module_param_data *param_data;
+		void *p;
+
+		struct gpr_pkt *pkt __free(kfree) =
+			audioreach_alloc_apm_cmd_pkt(fs_sz, APM_CMD_SET_CFG, 0);
+		if (IS_ERR(pkt))
+			return PTR_ERR(pkt);
+
+		p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+		fs_cfg = p;
+		param_data = &fs_cfg->param_data;
+		param_data->module_instance_id = module->instance_id;
+		param_data->error_code = 0;
+		param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
+		param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
+		fs_cfg->frame_size_factor = frame_size_factor;
+
+			return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+		}
+	}
+
+static int audioreach_tdm_send_hw_ep_mf(struct q6apm_graph *graph,
+					const struct audioreach_module *module,
+					const struct audioreach_module_config *cfg)
+{
+	struct apm_module_hw_ep_mf_cfg *hw_cfg;
+	struct apm_module_param_data *param_data;
+	int ep_sz = APM_HW_EP_CFG_PSIZE;
+	void *p;
+
+	struct gpr_pkt *pkt __free(kfree) =
+		audioreach_alloc_apm_cmd_pkt(ep_sz, APM_CMD_SET_CFG, 0);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
 	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
-	intf_cfg = p;
-
-	param_data = &intf_cfg->param_data;
-	param_data->module_instance_id = module->instance_id;
-	param_data->error_code = 0;
-	param_data->param_id = PARAM_ID_I2S_INTF_CFG;
-	param_data->param_size = ic_sz - APM_MODULE_PARAM_DATA_SIZE;
-
-	intf_cfg->cfg.lpaif_type = module->hw_interface_type;
-	intf_cfg->cfg.intf_idx = module->hw_interface_idx;
-	if (y700_i2s_lpaif_type >= 0)
-		intf_cfg->cfg.lpaif_type = y700_i2s_lpaif_type;
-	if (y700_i2s_intf_idx >= 0)
-		intf_cfg->cfg.intf_idx = y700_i2s_intf_idx;
-	/*
-	 * Y700's stock speaker path is Secondary TDM with an 8-slot backend.
-	 * The current I2S_SINK graph starts only when the DSP endpoint is
-	 * advertised with the 8-channel selector. The physical lane enablement
-	 * is tracked separately by the board routing and PA configuration.
-	 */
-	if (cfg->sd_line_mask == 0x0f || cfg->sd_line_mask == 0x03)
-		intf_cfg->cfg.sd_line_idx = I2S_8CHS;
-	else if (cfg->sd_line_mask)
-		intf_cfg->cfg.sd_line_idx = cfg->sd_line_mask;
-	else if (module->sd_line_idx)
-		intf_cfg->cfg.sd_line_idx = module->sd_line_idx;
-	else
-		intf_cfg->cfg.sd_line_idx = I2S_SD0;
-	if (y700_i2s_sd_line_idx >= 0)
-		intf_cfg->cfg.sd_line_idx = y700_i2s_sd_line_idx;
-
-	switch (cfg->fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
-	case SND_SOC_DAIFMT_BP_FP:
-		intf_cfg->cfg.ws_src = CONFIG_I2S_WS_SRC_INTERNAL;
-		break;
-	case SND_SOC_DAIFMT_BC_FC:
-		/* CPU is slave */
-		intf_cfg->cfg.ws_src = CONFIG_I2S_WS_SRC_EXTERNAL;
-		break;
-	default:
-		break;
-	}
-	if (y700_i2s_ws_src >= 0)
-		intf_cfg->cfg.ws_src = y700_i2s_ws_src;
-
-	p += ic_sz;
 	hw_cfg = p;
 	param_data = &hw_cfg->param_data;
 	param_data->module_instance_id = module->instance_id;
@@ -1203,352 +1233,32 @@ static int audioreach_i2s_set_media_format(struct q6apm_graph *graph,
 	hw_cfg->mf.num_channels = cfg->num_channels;
 	hw_cfg->mf.data_format = module->data_format;
 
-	p += ep_sz;
-	fs_cfg = p;
-	param_data = &fs_cfg->param_data;
-	param_data->module_instance_id = module->instance_id;
-	param_data->error_code = 0;
-	param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
-	param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
-	fs_cfg->frame_size_factor = cfg->frame_size_factor ?:
-				    module->frame_size_factor ?: 1;
-	if (y700_i2s_frame_size_factor >= 0)
-		fs_cfg->frame_size_factor = y700_i2s_frame_size_factor;
-
-	if (module->hw_interface_type == I2S_INTF_TYPE_SECONDARY ||
-	    y700_i2s_lpaif_type >= 0 || y700_i2s_intf_idx >= 0 ||
-	    y700_i2s_sd_line_idx >= 0 || y700_i2s_ws_src >= 0 ||
-	    y700_i2s_frame_size_factor >= 0) {
-		dev_info(graph->dev,
-			 "Y700 AR I2S cfg: graph=%u iid=0x%x module=0x%x hw_type=%u hw_idx=%u cfg rate=%u ch=%u bw=%u fmt=0x%x sd_mask=0x%x fsf=%u mod sd=%u ws=%u fsf=%u data_fmt=%u override type=%d idx=%d sd=%d ws=%d fsf=%d\n",
-			 graph->id, module->instance_id, module->module_id,
-			 module->hw_interface_type, module->hw_interface_idx,
-			 cfg->sample_rate, cfg->num_channels, cfg->bit_width,
-			 cfg->fmt, cfg->sd_line_mask, cfg->frame_size_factor,
-			 module->sd_line_idx, module->ws_src,
-			 module->frame_size_factor, module->data_format,
-			 y700_i2s_lpaif_type, y700_i2s_intf_idx,
-			 y700_i2s_sd_line_idx, y700_i2s_ws_src,
-			 y700_i2s_frame_size_factor);
-		dev_info(graph->dev,
-			 "Y700 AR I2S pkt: lpaif=%u idx=%u sd=0x%x ws=%u mf rate=%u ch=%u bw=%u data_fmt=%u fsf=%u\n",
-			 intf_cfg->cfg.lpaif_type, intf_cfg->cfg.intf_idx,
-			 intf_cfg->cfg.sd_line_idx, intf_cfg->cfg.ws_src,
-			 hw_cfg->mf.sample_rate, hw_cfg->mf.num_channels,
-			 hw_cfg->mf.bit_width, hw_cfg->mf.data_format,
-			 fs_cfg->frame_size_factor);
-	}
-
-	ret = q6apm_send_cmd_sync(graph->apm, pkt, 0);
-	if (ret && module->hw_interface_type == I2S_INTF_TYPE_SECONDARY)
-		dev_err(graph->dev,
-			"Y700 AR I2S SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-			graph->id, module->instance_id, ret);
-
-	return ret;
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
 
-#define Y700_TDM_CFG_MF		BIT(0)
-#define Y700_TDM_CFG_FSF	BIT(1)
-#define Y700_TDM_CFG_INTF	BIT(2)
-#define Y700_TDM_CFG_LANE	BIT(3)
-#define Y700_TDM_CFG_CLK	BIT(4)
-#define Y700_TDM_CFG_POWER	BIT(5)
-#define Y700_TDM_CFG_DMA_ALIGN	BIT(6)
-
-static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
-					   const struct audioreach_module *module,
-					   const struct audioreach_module_config *cfg)
+static int audioreach_tdm_send_intf(struct q6apm_graph *graph,
+				    const struct audioreach_module *module,
+				    const struct audioreach_module_config *cfg)
 {
-	struct apm_module_hw_ep_mf_cfg *hw_cfg;
-	struct apm_module_frame_size_factor_cfg *fs_cfg;
 	struct apm_tdm_module_intf_cfg *intf_cfg;
-	struct apm_tdm_module_lane_cfg *lane_cfg;
-	struct apm_module_hw_intf_clk_cfg *clk_cfg;
 	struct apm_module_param_data *param_data;
-	u32 slot_mask = cfg->sd_line_mask ?: 1;
-	u32 nslots = cfg->num_channels ?: module->frame_size_factor ?: 8;
-	u32 bit_width = cfg->bit_width ?: 32;
-	u32 media_rate = cfg->sample_rate;
-	u32 media_bit_width = bit_width;
-	u32 media_channels = cfg->num_channels;
-	u32 frame_size_factor = cfg->frame_size_factor ?:
-				module->frame_size_factor ?: 1;
-	u32 clock_id;
-	u32 clock_freq;
-	u32 clock_attr = CLOCK_ATTRIBUTE_COUPLE_NO;
-	u32 clock_root = CLOCK_ROOT_DEFAULT;
-	u32 lane_mask;
-	int active_mask = y700_tdm_cfg_mask;
+	bool y700_secondary_tdm = module->hw_interface_type == 0 &&
+				  module->hw_interface_idx == I2S_INTF_TYPE_SECONDARY &&
+				  cfg->frame_size_factor == 8;
+	u32 slot_mask = y700_secondary_tdm ? 0x3 : (cfg->sd_line_mask ?: 1);
+	u32 nslots = y700_secondary_tdm ? 8 :
+		     (cfg->num_channels ?: module->frame_size_factor ?: 8);
+	u32 bit_width = y700_secondary_tdm ? 32 : (cfg->bit_width ?: 32);
 	int ic_sz = APM_TDM_INTF_CFG_PSIZE;
-	int lane_sz = APM_TDM_LANE_CFG_PSIZE;
-	int ep_sz = APM_HW_EP_CFG_PSIZE;
-	int fs_sz = APM_FS_CFG_PSIZE;
-	int clk_sz = APM_HW_INTF_CLK_CFG_PSIZE;
-	int pm_sz = APM_HW_EP_PMODE_CFG_PSIZE;
-	int align_sz = APM_HW_EP_DALIGN_CFG_PSIZE;
-	int size = ic_sz;
 	void *p;
-	int ret;
 
-	if (y700_tdm_media_rate > 0)
-		media_rate = y700_tdm_media_rate;
-	if (y700_tdm_media_channels > 0)
-		media_channels = y700_tdm_media_channels;
-	if (y700_tdm_media_bit_width > 0)
-		media_bit_width = y700_tdm_media_bit_width;
-	if (y700_tdm_slot_mask >= 0)
-		slot_mask = y700_tdm_slot_mask;
-	if (y700_tdm_nslots >= 0)
-		nslots = y700_tdm_nslots;
-	if (y700_tdm_slot_width >= 0)
-		bit_width = y700_tdm_slot_width;
-	if (y700_tdm_frame_size_factor >= 0)
-		frame_size_factor = y700_tdm_frame_size_factor;
-	if (y700_tdm_power_mode >= 0)
-		active_mask |= Y700_TDM_CFG_POWER;
-	if (y700_tdm_dma_align >= 0)
-		active_mask |= Y700_TDM_CFG_DMA_ALIGN;
-	clock_id = CLOCK_ID_PRI_TDM_IBIT + 2 * (y700_tdm_intf_idx >= 0 ?
-		   y700_tdm_intf_idx : module->hw_interface_idx);
-	clock_freq = media_rate * nslots * bit_width;
-	if (y700_tdm_clk_attr >= 0)
-		clock_attr = y700_tdm_clk_attr;
-	if (y700_tdm_clk_root >= 0)
-		clock_root = y700_tdm_clk_root;
-	if (y700_tdm_clk_freq > 0)
-		clock_freq = y700_tdm_clk_freq;
-
-	dev_info(graph->dev,
-		 "Y700 AR TDM control: graph=%u iid=0x%x module=0x%x mask=0x%x combined=%d media_override rate=%d ch=%d bw=%d clk_attr=%d clk_root=%d clk_freq=%d power=%d dma_align=%d\n",
-		 graph->id, module->instance_id, module->module_id,
-		 active_mask, y700_tdm_combined_setcfg, y700_tdm_media_rate,
-		 y700_tdm_media_channels, y700_tdm_media_bit_width,
-		 y700_tdm_clk_attr, y700_tdm_clk_root, y700_tdm_clk_freq,
-		 y700_tdm_power_mode, y700_tdm_dma_align);
-
-	if (y700_tdm_combined_setcfg) {
-		if (active_mask & Y700_TDM_CFG_MF)
-			size += ep_sz;
-		if (active_mask & Y700_TDM_CFG_FSF)
-			size += fs_sz;
-		if (active_mask & Y700_TDM_CFG_INTF)
-			size += ic_sz;
-		if (active_mask & Y700_TDM_CFG_LANE)
-			size += lane_sz;
-		if (active_mask & Y700_TDM_CFG_CLK)
-			size += clk_sz;
-		if ((active_mask & Y700_TDM_CFG_POWER) && y700_tdm_power_mode >= 0)
-			size += pm_sz;
-		if ((active_mask & Y700_TDM_CFG_DMA_ALIGN) && y700_tdm_dma_align >= 0)
-			size += align_sz;
-
-		struct gpr_pkt *combined_pkt __free(kfree) =
-			audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
-		if (IS_ERR(combined_pkt))
-			return PTR_ERR(combined_pkt);
-
-		p = (void *)combined_pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
-
-		if (active_mask & Y700_TDM_CFG_MF) {
-			hw_cfg = p;
-			param_data = &hw_cfg->param_data;
-			param_data->module_instance_id = module->instance_id;
-			param_data->error_code = 0;
-			param_data->param_id = PARAM_ID_HW_EP_MF_CFG;
-			param_data->param_size = ep_sz - APM_MODULE_PARAM_DATA_SIZE;
-			hw_cfg->mf.sample_rate = media_rate;
-			hw_cfg->mf.bit_width = media_bit_width;
-			hw_cfg->mf.num_channels = media_channels;
-			hw_cfg->mf.data_format = module->data_format;
-			p += ep_sz;
-		}
-
-		if (active_mask & Y700_TDM_CFG_FSF) {
-			fs_cfg = p;
-			param_data = &fs_cfg->param_data;
-			param_data->module_instance_id = module->instance_id;
-			param_data->error_code = 0;
-			param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
-			param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
-			fs_cfg->frame_size_factor = frame_size_factor;
-			p += fs_sz;
-		}
-
-		if (active_mask & Y700_TDM_CFG_INTF) {
-			intf_cfg = p;
-			param_data = &intf_cfg->param_data;
-			param_data->module_instance_id = module->instance_id;
-			param_data->error_code = 0;
-			param_data->param_id = PARAM_ID_TDM_INTF_CFG;
-			param_data->param_size = ic_sz - APM_MODULE_PARAM_DATA_SIZE;
-			intf_cfg->cfg.lpaif_type = y700_tdm_lpaif_type >= 0 ?
-						   y700_tdm_lpaif_type : module->hw_interface_type;
-			intf_cfg->cfg.intf_idx = y700_tdm_intf_idx >= 0 ?
-						 y700_tdm_intf_idx : module->hw_interface_idx;
-			intf_cfg->cfg.sync_src = y700_tdm_sync_src >= 0 ?
-						 y700_tdm_sync_src : TDM_SYNC_SRC_INTERNAL;
-			intf_cfg->cfg.ctrl_data_out_enable = y700_tdm_ctrl_data_oe >= 0 ?
-							     y700_tdm_ctrl_data_oe :
-							     TDM_CTRL_DATA_OE_ENABLE;
-			intf_cfg->cfg.slot_mask = slot_mask;
-			intf_cfg->cfg.nslots_per_frame = nslots;
-			intf_cfg->cfg.slot_width = bit_width;
-			intf_cfg->cfg.sync_mode = y700_tdm_sync_mode >= 0 ?
-						  y700_tdm_sync_mode :
-						  TDM_SHORT_SYNC_SLOT_MODE;
-			intf_cfg->cfg.ctrl_invert_sync_pulse = y700_tdm_invert_sync >= 0 ?
-							       y700_tdm_invert_sync :
-							       TDM_SYNC_NORMAL;
-			intf_cfg->cfg.ctrl_sync_data_delay = y700_tdm_sync_delay >= 0 ?
-							     y700_tdm_sync_delay :
-							     TDM_DATA_DELAY_1_BCLK_CYCLE;
-			p += ic_sz;
-		}
-
-		if (active_mask & Y700_TDM_CFG_LANE) {
-			lane_cfg = p;
-			param_data = &lane_cfg->param_data;
-			param_data->module_instance_id = module->instance_id;
-			param_data->error_code = 0;
-			param_data->param_id = PARAM_ID_TDM_LANE_CFG;
-			param_data->param_size = lane_sz - APM_MODULE_PARAM_DATA_SIZE;
-			lane_cfg->cfg.lane_mask = y700_tdm_lane_mask >= 0 ?
-						  y700_tdm_lane_mask : slot_mask;
-			p += lane_sz;
-		}
-
-		if (active_mask & Y700_TDM_CFG_CLK) {
-			clk_cfg = p;
-			param_data = &clk_cfg->param_data;
-			param_data->module_instance_id = module->instance_id;
-			param_data->error_code = 0;
-			param_data->param_id = PARAM_ID_HW_INTF_CLK_CFG;
-			param_data->param_size = clk_sz - APM_MODULE_PARAM_DATA_SIZE;
-			clk_cfg->cfg.clock_id = clock_id;
-			clk_cfg->cfg.clock_freq = clock_freq;
-			clk_cfg->cfg.clock_attri = clock_attr;
-			clk_cfg->cfg.clock_root = clock_root;
-			p += clk_sz;
-		}
-
-		if ((active_mask & Y700_TDM_CFG_POWER) && y700_tdm_power_mode >= 0) {
-			struct apm_module_hw_ep_power_mode_cfg *pm_cfg = p;
-
-			param_data = &pm_cfg->param_data;
-			param_data->module_instance_id = module->instance_id;
-			param_data->error_code = 0;
-			param_data->param_id = PARAM_ID_HW_EP_POWER_MODE_CFG;
-			param_data->param_size = pm_sz - APM_MODULE_PARAM_DATA_SIZE;
-			pm_cfg->power_mode.power_mode = y700_tdm_power_mode;
-			p += pm_sz;
-		}
-
-		if ((active_mask & Y700_TDM_CFG_DMA_ALIGN) && y700_tdm_dma_align >= 0) {
-			struct apm_module_hw_ep_dma_data_align_cfg *align_cfg = p;
-
-			param_data = &align_cfg->param_data;
-			param_data->module_instance_id = module->instance_id;
-			param_data->error_code = 0;
-			param_data->param_id = PARAM_ID_HW_EP_DMA_DATA_ALIGN;
-			param_data->param_size = align_sz - APM_MODULE_PARAM_DATA_SIZE;
-			align_cfg->align.dma_data_align = y700_tdm_dma_align;
-			p += align_sz;
-		}
-
-		dev_info(graph->dev,
-			 "Y700 AR TDM combined SET_CFG: graph=%u iid=0x%x size=%d mask=0x%x\n",
-			 graph->id, module->instance_id, size, active_mask);
-		ret = q6apm_send_cmd_sync(graph->apm, combined_pkt, 0);
-		if (ret)
-			dev_err(graph->dev,
-				"Y700 AR TDM combined SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-				graph->id, module->instance_id, ret);
-		return ret;
-	}
-
-	if (active_mask & Y700_TDM_CFG_MF) {
-
-	struct gpr_pkt *mf_pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(ep_sz, APM_CMD_SET_CFG, 0);
-	if (IS_ERR(mf_pkt))
-		return PTR_ERR(mf_pkt);
-
-	p = (void *)mf_pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
-	hw_cfg = p;
-
-	param_data = &hw_cfg->param_data;
-	param_data->module_instance_id = module->instance_id;
-	param_data->error_code = 0;
-	param_data->param_id = PARAM_ID_HW_EP_MF_CFG;
-	param_data->param_size = ep_sz - APM_MODULE_PARAM_DATA_SIZE;
-
-	hw_cfg->mf.sample_rate = media_rate;
-
-	hw_cfg->mf.bit_width = media_bit_width;
-	hw_cfg->mf.num_channels = media_channels;
-	hw_cfg->mf.data_format = module->data_format;
-
-	dev_info(graph->dev,
-		 "Y700 AR TDM mf-only pkt: graph=%u iid=0x%x module=0x%x rate=%u ch=%u bw=%u cfg_bw=%u data_fmt=%u\n",
-		 graph->id, module->instance_id, module->module_id,
-		 hw_cfg->mf.sample_rate, hw_cfg->mf.num_channels,
-		 hw_cfg->mf.bit_width, bit_width, hw_cfg->mf.data_format);
-
-	ret = q6apm_send_cmd_sync(graph->apm, mf_pkt, 0);
-	if (ret) {
-		dev_err(graph->dev,
-			"Y700 AR TDM MF SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-			graph->id, module->instance_id, ret);
-		return ret;
-	}
-
-	}
-
-	if (active_mask & Y700_TDM_CFG_FSF) {
-
-	struct gpr_pkt *fs_pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(fs_sz, APM_CMD_SET_CFG, 0);
-	if (IS_ERR(fs_pkt))
-		return PTR_ERR(fs_pkt);
-
-	p = (void *)fs_pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
-	fs_cfg = p;
-
-	param_data = &fs_cfg->param_data;
-	param_data->module_instance_id = module->instance_id;
-	param_data->error_code = 0;
-	param_data->param_id = PARAM_ID_HW_EP_FRAME_SIZE_FACTOR;
-	param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
-	frame_size_factor = cfg->frame_size_factor ?:
-			    module->frame_size_factor ?: 1;
-	if (y700_tdm_frame_size_factor >= 0)
-		frame_size_factor = y700_tdm_frame_size_factor;
-
-	fs_cfg->frame_size_factor = frame_size_factor;
-
-	dev_info(graph->dev,
-		 "Y700 AR TDM fsf-only pkt: graph=%u iid=0x%x module=0x%x fsf=%u\n",
-		 graph->id, module->instance_id, module->module_id,
-		 fs_cfg->frame_size_factor);
-
-	ret = q6apm_send_cmd_sync(graph->apm, fs_pkt, 0);
-	if (ret) {
-		dev_err(graph->dev,
-			"Y700 AR TDM FSF SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-			graph->id, module->instance_id, ret);
-		return ret;
-	}
-
-	}
-
-	if (active_mask & Y700_TDM_CFG_INTF) {
-
-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
+	struct gpr_pkt *pkt __free(kfree) =
+		audioreach_alloc_apm_cmd_pkt(ic_sz, APM_CMD_SET_CFG, 0);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
 	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
 	intf_cfg = p;
-
 	param_data = &intf_cfg->param_data;
 	param_data->module_instance_id = module->instance_id;
 	param_data->error_code = 0;
@@ -1557,277 +1267,116 @@ static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
 
 	intf_cfg->cfg.lpaif_type = module->hw_interface_type;
 	intf_cfg->cfg.intf_idx = module->hw_interface_idx;
-	if (y700_tdm_lpaif_type >= 0)
-		intf_cfg->cfg.lpaif_type = y700_tdm_lpaif_type;
-	if (y700_tdm_intf_idx >= 0)
-		intf_cfg->cfg.intf_idx = y700_tdm_intf_idx;
 	switch (cfg->fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
-	case SND_SOC_DAIFMT_BP_FP:
-		intf_cfg->cfg.sync_src = TDM_SYNC_SRC_INTERNAL;
-		break;
 	case SND_SOC_DAIFMT_BC_FC:
 		intf_cfg->cfg.sync_src = TDM_SYNC_SRC_EXTERNAL;
 		break;
+	case SND_SOC_DAIFMT_BP_FP:
 	default:
 		intf_cfg->cfg.sync_src = TDM_SYNC_SRC_INTERNAL;
 		break;
 	}
-	if (y700_tdm_sync_src >= 0)
-		intf_cfg->cfg.sync_src = y700_tdm_sync_src;
 	intf_cfg->cfg.ctrl_data_out_enable = TDM_CTRL_DATA_OE_ENABLE;
-	if (y700_tdm_ctrl_data_oe >= 0)
-		intf_cfg->cfg.ctrl_data_out_enable = y700_tdm_ctrl_data_oe;
-	if (y700_tdm_slot_mask >= 0)
-		slot_mask = y700_tdm_slot_mask;
-	if (y700_tdm_nslots >= 0)
-		nslots = y700_tdm_nslots;
-	if (y700_tdm_slot_width >= 0)
-		bit_width = y700_tdm_slot_width;
 	intf_cfg->cfg.slot_mask = slot_mask;
 	intf_cfg->cfg.nslots_per_frame = nslots;
 	intf_cfg->cfg.slot_width = bit_width;
-	intf_cfg->cfg.sync_mode = TDM_SHORT_SYNC_SLOT_MODE;
-	if (y700_tdm_sync_mode >= 0)
-		intf_cfg->cfg.sync_mode = y700_tdm_sync_mode;
+	intf_cfg->cfg.sync_mode = TDM_SHORT_SYNC_BIT_MODE;
 	intf_cfg->cfg.ctrl_invert_sync_pulse = TDM_SYNC_NORMAL;
-	if (y700_tdm_invert_sync >= 0)
-		intf_cfg->cfg.ctrl_invert_sync_pulse = y700_tdm_invert_sync;
-	intf_cfg->cfg.ctrl_sync_data_delay = TDM_DATA_DELAY_1_BCLK_CYCLE;
-	if (y700_tdm_sync_delay >= 0)
-		intf_cfg->cfg.ctrl_sync_data_delay = y700_tdm_sync_delay;
+	intf_cfg->cfg.ctrl_sync_data_delay = 0;
 
-	dev_info(graph->dev,
-		 "Y700 AR TDM intf-only pkt: graph=%u iid=0x%x module=0x%x lpaif=%u idx=%u sync=%u oe=%u slot=0x%x nslots=%u width=%u mode=%u inv=%u delay=%u rate=%u ch=%u data_fmt=%u fsf=%u overrides type=%d idx=%d sync=%d oe=%d slot=%d nslots=%d width=%d mode=%d inv=%d delay=%d lane=%d fsf=%d\n",
-		 graph->id, module->instance_id, module->module_id,
-		 intf_cfg->cfg.lpaif_type, intf_cfg->cfg.intf_idx,
-		 intf_cfg->cfg.sync_src, intf_cfg->cfg.ctrl_data_out_enable,
-		 intf_cfg->cfg.slot_mask, intf_cfg->cfg.nslots_per_frame,
-		 intf_cfg->cfg.slot_width, intf_cfg->cfg.sync_mode,
-		 intf_cfg->cfg.ctrl_invert_sync_pulse,
-		 intf_cfg->cfg.ctrl_sync_data_delay, cfg->sample_rate,
-		 cfg->num_channels, module->data_format, frame_size_factor,
-		 y700_tdm_lpaif_type, y700_tdm_intf_idx, y700_tdm_sync_src,
-		 y700_tdm_ctrl_data_oe, y700_tdm_slot_mask, y700_tdm_nslots,
-		 y700_tdm_slot_width, y700_tdm_sync_mode,
-		 y700_tdm_invert_sync, y700_tdm_sync_delay,
-		 y700_tdm_lane_mask, y700_tdm_frame_size_factor);
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+}
 
-	ret = q6apm_send_cmd_sync(graph->apm, pkt, 0);
-	if (ret)
-		dev_err(graph->dev,
-			"Y700 AR TDM SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-			graph->id, module->instance_id, ret);
-	if (ret)
-		return ret;
+static int audioreach_tdm_send_lane(struct q6apm_graph *graph,
+				    const struct audioreach_module *module,
+				    const struct audioreach_module_config *cfg)
+{
+	struct apm_tdm_module_lane_cfg *lane_cfg;
+	struct apm_module_param_data *param_data;
+	u32 lane_mask = cfg->sd_line_mask ?: 1;
+	int lane_sz = APM_TDM_LANE_CFG_PSIZE;
+	void *p;
 
-	}
+	struct gpr_pkt *pkt __free(kfree) =
+		audioreach_alloc_apm_cmd_pkt(lane_sz, APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
 
-	if (active_mask & Y700_TDM_CFG_LANE) {
-
-	struct gpr_pkt *lane_pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(lane_sz, APM_CMD_SET_CFG, 0);
-	if (IS_ERR(lane_pkt))
-		return PTR_ERR(lane_pkt);
-
-	p = (void *)lane_pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
 	lane_cfg = p;
-
 	param_data = &lane_cfg->param_data;
 	param_data->module_instance_id = module->instance_id;
 	param_data->error_code = 0;
 	param_data->param_id = PARAM_ID_TDM_LANE_CFG;
 	param_data->param_size = lane_sz - APM_MODULE_PARAM_DATA_SIZE;
-
-	/*
-	 * Y700's speaker bus uses SD0 + SD1.  Slot placement and lane enablement
-	 * are separate TDM endpoint parameters, so describe the active lanes
-	 * explicitly instead of assuming the slot mask also enables them.
-	 */
-	lane_mask = slot_mask;
-	if (y700_tdm_lane_mask >= 0)
-		lane_mask = y700_tdm_lane_mask;
-
 	lane_cfg->cfg.lane_mask = lane_mask;
 
-	dev_info(graph->dev,
-		 "Y700 AR TDM lane pkt: graph=%u iid=0x%x module=0x%x lane_mask=0x%x\n",
-		 graph->id, module->instance_id, module->module_id,
-		 lane_cfg->cfg.lane_mask);
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+}
 
-	ret = q6apm_send_cmd_sync(graph->apm, lane_pkt, 0);
-	if (ret)
-		dev_err(graph->dev,
-			"Y700 AR TDM LANE SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-			graph->id, module->instance_id, ret);
-	if (ret)
-		return ret;
+static int audioreach_tdm_send_clk(struct q6apm_graph *graph,
+				   const struct audioreach_module *module,
+				   const struct audioreach_module_config *cfg)
+{
+	struct apm_module_hw_intf_clk_cfg *clk_cfg;
+	struct apm_module_param_data *param_data;
+	bool y700_secondary_tdm = module->hw_interface_type == 0 &&
+				  module->hw_interface_idx == I2S_INTF_TYPE_SECONDARY &&
+				  cfg->frame_size_factor == 8;
+	u32 nslots = y700_secondary_tdm ? 8 :
+		     (cfg->num_channels ?: module->frame_size_factor ?: 8);
+	u32 bit_width = y700_secondary_tdm ? 32 : (cfg->bit_width ?: 32);
+	u32 clock_freq = cfg->sample_rate * nslots * bit_width;
+	u32 clock_id = CLOCK_ID_PRI_TDM_IBIT + 2 * module->hw_interface_idx;
+	int clk_sz = APM_HW_INTF_CLK_CFG_PSIZE;
+	void *p;
 
-	}
+	struct gpr_pkt *pkt __free(kfree) =
+		audioreach_alloc_apm_cmd_pkt(clk_sz, APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
 
-	if (active_mask & Y700_TDM_CFG_CLK) {
-
-	struct gpr_pkt *clk_pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(clk_sz, APM_CMD_SET_CFG, 0);
-	if (IS_ERR(clk_pkt))
-		return PTR_ERR(clk_pkt);
-
-	p = (void *)clk_pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
 	clk_cfg = p;
-
 	param_data = &clk_cfg->param_data;
 	param_data->module_instance_id = module->instance_id;
 	param_data->error_code = 0;
 	param_data->param_id = PARAM_ID_HW_INTF_CLK_CFG;
 	param_data->param_size = clk_sz - APM_MODULE_PARAM_DATA_SIZE;
 
-	clock_id = CLOCK_ID_PRI_TDM_IBIT + 2 * (y700_tdm_intf_idx >= 0 ?
-		   y700_tdm_intf_idx : module->hw_interface_idx);
-	clock_freq = media_rate * nslots * bit_width;
-	if (y700_tdm_clk_attr >= 0)
-		clock_attr = y700_tdm_clk_attr;
-	if (y700_tdm_clk_root >= 0)
-		clock_root = y700_tdm_clk_root;
-	if (y700_tdm_clk_freq > 0)
-		clock_freq = y700_tdm_clk_freq;
 	clk_cfg->cfg.clock_id = clock_id;
 	clk_cfg->cfg.clock_freq = clock_freq;
-	clk_cfg->cfg.clock_attri = clock_attr;
-	clk_cfg->cfg.clock_root = clock_root;
+	clk_cfg->cfg.clock_attri = CLOCK_ATTRIBUTE_COUPLE_NO;
+	clk_cfg->cfg.clock_root = CLOCK_ROOT_DEFAULT;
 
-	dev_info(graph->dev,
-		 "Y700 AR TDM clk pkt: graph=%u iid=0x%x module=0x%x clk_id=0x%x freq=%u attr=%u root=%u\n",
-		 graph->id, module->instance_id, module->module_id,
-		 clk_cfg->cfg.clock_id, clk_cfg->cfg.clock_freq,
-		 clk_cfg->cfg.clock_attri, clk_cfg->cfg.clock_root);
-
-	ret = q6apm_send_cmd_sync(graph->apm, clk_pkt, 0);
-	if (ret)
-		dev_err(graph->dev,
-			"Y700 AR TDM CLK SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-			graph->id, module->instance_id, ret);
-	if (ret)
-		return ret;
-
-	}
-
-	if (active_mask & Y700_TDM_CFG_POWER) {
-		struct apm_module_hw_ep_power_mode_cfg *pm_cfg;
-		struct apm_module_param_data *pd;
-		struct gpr_pkt *pm_pkt __free(kfree) =
-			audioreach_alloc_apm_cmd_pkt(pm_sz, APM_CMD_SET_CFG, 0);
-
-		if (IS_ERR(pm_pkt))
-			return PTR_ERR(pm_pkt);
-
-		p = (void *)pm_pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
-		pm_cfg = p;
-		pd = &pm_cfg->param_data;
-		pd->module_instance_id = module->instance_id;
-		pd->error_code = 0;
-		pd->param_id = PARAM_ID_HW_EP_POWER_MODE_CFG;
-		pd->param_size = pm_sz - APM_MODULE_PARAM_DATA_SIZE;
-		pm_cfg->power_mode.power_mode = y700_tdm_power_mode;
-
-		dev_info(graph->dev,
-			 "Y700 AR TDM power pkt: graph=%u iid=0x%x module=0x%x mode=%d\n",
-			 graph->id, module->instance_id, module->module_id,
-			 y700_tdm_power_mode);
-		ret = q6apm_send_cmd_sync(graph->apm, pm_pkt, 0);
-		if (ret) {
-			dev_err(graph->dev,
-				"Y700 AR TDM POWER SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-				graph->id, module->instance_id, ret);
-			return ret;
-		}
-	}
-
-	if (active_mask & Y700_TDM_CFG_DMA_ALIGN) {
-		struct apm_module_hw_ep_dma_data_align_cfg *align_cfg;
-		struct apm_module_param_data *pd;
-		struct gpr_pkt *align_pkt __free(kfree) =
-			audioreach_alloc_apm_cmd_pkt(align_sz, APM_CMD_SET_CFG, 0);
-
-		if (IS_ERR(align_pkt))
-			return PTR_ERR(align_pkt);
-
-		p = (void *)align_pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
-		align_cfg = p;
-		pd = &align_cfg->param_data;
-		pd->module_instance_id = module->instance_id;
-		pd->error_code = 0;
-		pd->param_id = PARAM_ID_HW_EP_DMA_DATA_ALIGN;
-		pd->param_size = align_sz - APM_MODULE_PARAM_DATA_SIZE;
-		align_cfg->align.dma_data_align = y700_tdm_dma_align;
-
-		dev_info(graph->dev,
-			 "Y700 AR TDM dma-align pkt: graph=%u iid=0x%x module=0x%x align=%d\n",
-			 graph->id, module->instance_id, module->module_id,
-			 y700_tdm_dma_align);
-		ret = q6apm_send_cmd_sync(graph->apm, align_pkt, 0);
-		if (ret) {
-			dev_err(graph->dev,
-				"Y700 AR TDM DMA_ALIGN SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-				graph->id, module->instance_id, ret);
-			return ret;
-		}
-	}
-
-	return 0;
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
 
-static int audioreach_spr_set_media_format(struct q6apm_graph *graph,
+static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
 					   const struct audioreach_module *module,
 					   const struct audioreach_module_config *cfg)
 {
-	struct apm_module_spr_delay_path_end_cfg *delay_cfg;
-	struct apm_module_param_data *param_data;
-	int size = APM_SPR_DELAY_PATH_END_CFG_PSIZE;
-	void *p;
+	bool y700_secondary_tdm = module->hw_interface_type == TDM_LPAIF_TYPE_LPAIF &&
+				  module->hw_interface_idx == TDM_INTF_TYPE_SECONDARY &&
+				  cfg->frame_size_factor == 8;
 	int ret;
 
-	if (!y700_spr_delay_path_end_iid) {
-		dev_info(graph->dev,
-			 "Y700 AR SPR delay-path disabled: graph=%u iid=0x%x module=0x%x\n",
-			 graph->id, module->instance_id, module->module_id);
-		return 0;
-	}
-
-	if (y700_spr_delay_path_graph >= 0 &&
-	    graph->id != y700_spr_delay_path_graph) {
-		dev_info(graph->dev,
-			 "Y700 AR SPR delay-path skipped: graph=%u target_graph=%d iid=0x%x module=0x%x\n",
-			 graph->id, y700_spr_delay_path_graph,
-			 module->instance_id, module->module_id);
-		return 0;
-	}
-
-	struct gpr_pkt *pkt __free(kfree) =
-		audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
-	if (IS_ERR(pkt))
-		return PTR_ERR(pkt);
-
-	p = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
-	delay_cfg = p;
-
-	param_data = &delay_cfg->param_data;
-	param_data->module_instance_id = module->instance_id;
-	param_data->error_code = 0;
-	param_data->param_id = PARAM_ID_SPR_DELAY_PATH_END;
-	param_data->param_size = size - APM_MODULE_PARAM_DATA_SIZE;
-
-	delay_cfg->module_instance_id = y700_spr_delay_path_end_iid;
-
-	dev_info(graph->dev,
-		 "Y700 AR SPR delay-path pkt: graph=%u iid=0x%x module=0x%x end_iid=0x%x rate=%u ch=%u bw=%u\n",
-		 graph->id, module->instance_id, module->module_id,
-		 delay_cfg->module_instance_id, cfg->sample_rate,
-		 cfg->num_channels, cfg->bit_width);
-
-	ret = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	ret = audioreach_tdm_send_hw_ep_mf(graph, module, cfg);
 	if (ret)
-		dev_err(graph->dev,
-			"Y700 AR SPR delay-path SET_CFG failed: graph=%u iid=0x%x ret=%d\n",
-			graph->id, module->instance_id, ret);
+		return ret;
 
-	return ret;
+	ret = audioreach_tdm_send_intf(graph, module, cfg);
+	if (ret)
+		return ret;
+
+	if (y700_secondary_tdm)
+		return 0;
+
+	ret = audioreach_tdm_send_lane(graph, module, cfg);
+	if (ret)
+		return ret;
+
+	return audioreach_tdm_send_clk(graph, module, cfg);
 }
 
 static int audioreach_logging_set_media_format(struct q6apm_graph *graph,
@@ -2132,9 +1681,6 @@ int audioreach_set_media_format(struct q6apm_graph *graph,
 	case MODULE_ID_TDM_SOURCE:
 	case MODULE_ID_TDM_SINK:
 		rc = audioreach_tdm_set_media_format(graph, module, cfg);
-		break;
-	case MODULE_ID_SPR:
-		rc = audioreach_spr_set_media_format(graph, module, cfg);
 		break;
 	case MODULE_ID_WR_SHARED_MEM_EP:
 		rc = audioreach_shmem_set_media_format(graph, module, cfg);
