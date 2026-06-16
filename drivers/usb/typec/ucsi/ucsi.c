@@ -1158,6 +1158,8 @@ static void ucsi_unregister_partner(struct ucsi_connector *con)
 static void ucsi_partner_change(struct ucsi_connector *con)
 {
 	enum usb_role u_role = USB_ROLE_NONE;
+	bool preserve_altmode_mux = false;
+	bool source_host_role = false;
 	int ret;
 
 	switch (UCSI_CONSTAT(con, PARTNER_TYPE)) {
@@ -1185,8 +1187,15 @@ static void ucsi_partner_change(struct ucsi_connector *con)
 			typec_set_mode(con->port, TYPEC_MODE_AUDIO);
 			break;
 		default:
-			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
+			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB)) {
+				preserve_altmode_mux =
+					(con->ucsi->quirks & UCSI_PRESERVE_ALTMODE_MUX) &&
+					UCSI_CONSTAT(con, PARTNER_FLAG_ALT_MODE);
+				if (preserve_altmode_mux)
+					break;
+
 				typec_set_mode(con->port, TYPEC_STATE_USB);
+			}
 		}
 
 		if (((con->ucsi->version >= UCSI_VERSION_3_0 &&
@@ -1201,6 +1210,25 @@ static void ucsi_partner_change(struct ucsi_connector *con)
 	     (!(UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN3) ||
 		UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN4)))))
 		u_role = USB_ROLE_NONE;
+
+	if ((con->ucsi->quirks & UCSI_PRESERVE_ALTMODE_MUX) &&
+	    UCSI_CONSTAT(con, CONNECTED) &&
+	    UCSI_CONSTAT(con, PARTNER_FLAG_USB) &&
+	    !UCSI_CONSTAT(con, PWR_DIR) &&
+	    (UCSI_CONSTAT(con, PARTNER_TYPE) == UCSI_CONSTAT_PARTNER_TYPE_DFP ||
+	     UCSI_CONSTAT(con, PARTNER_TYPE) == 0)) {
+		u_role = USB_ROLE_HOST;
+		typec_set_data_role(con->port, TYPEC_HOST);
+		source_host_role = true;
+	}
+
+	dev_dbg(con->ucsi->dev,
+		"con%d partner_change connected=%lu change=0x%lx type=%lu flags=0x%lx pwr_dir=%lu opmode=%lu u_role=%d preserve_altmode=%d source_host_role=%d\n",
+		con->num, UCSI_CONSTAT(con, CONNECTED),
+		UCSI_CONSTAT(con, CHANGE), UCSI_CONSTAT(con, PARTNER_TYPE),
+		UCSI_CONSTAT(con, PARTNER_FLAGS), UCSI_CONSTAT(con, PWR_DIR),
+		UCSI_CONSTAT(con, PWR_OPMODE), u_role, preserve_altmode_mux,
+		source_host_role);
 
 	ret = usb_role_switch_set_role(con->usb_role_sw, u_role);
 	if (ret)
@@ -1218,6 +1246,9 @@ static int ucsi_check_connection(struct ucsi_connector *con)
 		dev_err(con->ucsi->dev, "GET_CONNECTOR_STATUS failed (%d)\n", ret);
 		return ret;
 	}
+
+	if (con->ucsi->ops->connector_status)
+		con->ucsi->ops->connector_status(con);
 
 	if (UCSI_CONSTAT(con, CONNECTED)) {
 		if (prev_state)

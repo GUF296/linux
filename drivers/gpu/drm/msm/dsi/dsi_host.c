@@ -166,6 +166,7 @@ struct msm_dsi_host {
 
 	struct drm_display_mode *mode;
 	struct drm_dsc_config *dsc;
+	unsigned int dsc_slice_per_pkt;
 
 	/* connected device info */
 	unsigned int channel;
@@ -931,24 +932,25 @@ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mod
 	u32 pkt_per_line;
 	u32 eol_byte_num;
 	u32 bytes_per_pkt;
+	u32 slice_per_pkt;
 
 	/* first calculate dsc parameters and then program
 	 * compress mode registers
 	 */
 	slice_per_intf = dsc->slice_count;
+	slice_per_pkt = msm_host->dsc_slice_per_pkt ?: 1;
+	if (slice_per_pkt > slice_per_intf) {
+		dev_warn_once(&msm_host->pdev->dev,
+			      "invalid DSC slice_per_pkt=%u for slice_count=%u, clamping\n",
+			      slice_per_pkt, slice_per_intf);
+		slice_per_pkt = slice_per_intf;
+	}
 
 	total_bytes_per_intf = dsc->slice_chunk_size * slice_per_intf;
-	bytes_per_pkt = dsc->slice_chunk_size; /* * slice_per_pkt; */
+	bytes_per_pkt = dsc->slice_chunk_size * slice_per_pkt;
 
 	eol_byte_num = total_bytes_per_intf % 3;
-
-	/*
-	 * Typically, pkt_per_line = slice_per_intf * slice_per_pkt.
-	 *
-	 * Since the current driver only supports slice_per_pkt = 1,
-	 * pkt_per_line will be equal to slice per intf for now.
-	 */
-	pkt_per_line = slice_per_intf;
+	pkt_per_line = DIV_ROUND_UP(slice_per_intf, slice_per_pkt);
 
 	if (is_cmd_mode) /* packet data type */
 		reg = DSI_COMMAND_COMPRESSION_MODE_CTRL_STREAM0_DATATYPE(MIPI_DSI_DCS_LONG_WRITE);
@@ -1718,8 +1720,10 @@ static int dsi_host_attach(struct mipi_dsi_host *host,
 	msm_host->lanes = dsi->lanes;
 	msm_host->format = dsi->format;
 	msm_host->mode_flags = dsi->mode_flags;
-	if (dsi->dsc)
+	if (dsi->dsc) {
 		msm_host->dsc = dsi->dsc;
+		msm_host->dsc_slice_per_pkt = dsi->dsc_slice_per_pkt ?: 1;
+	}
 
 	if (msm_host->format == MIPI_DSI_FMT_RGB101010) {
 		if (!msm_dsi_host_version_geq(msm_host, MSM_DSI_VER_MAJOR_6G,

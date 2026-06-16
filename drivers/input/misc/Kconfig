@@ -137,6 +137,19 @@ config INPUT_AW86927
 	  To compile this driver as a module, choose M here: the
 	  module will be called aw86927.
 
+config INPUT_AW86937_Y700
+	tristate "Lenovo Y700 AW86937 haptics"
+	depends on I2C && INPUT
+	select REGMAP_I2C
+	help
+	  Say Y here to enable the dual AW86937 haptic ICs used by the
+	  Lenovo Y700. The driver exposes standard input force-feedback
+	  FF_RUMBLE devices and intentionally preserves the chip boot-time
+	  boost register value.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called aw86937-y700.
+
 config INPUT_BBNSM_PWRKEY
 	tristate "NXP BBNSM Power Key Driver"
 	depends on ARCH_MXC || COMPILE_TEST

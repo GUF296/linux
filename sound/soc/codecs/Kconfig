@@ -658,6 +658,15 @@ config SND_SOC_AW8738
 	  SND_SOC_SIMPLE_AMPLIFIER, but additionally allows setting the
 	  operation mode using the Awinic-specific one-wire pulse control.
 
+config SND_SOC_AW882XX
+	tristate "Awinic AW882xx smart PA"
+	depends on I2C
+	select GPIOLIB
+	help
+	  Enable support for Awinic AW882xx smart speaker amplifiers.
+	  This is used by Lenovo Y700 TB321FU speaker PAs described by
+	  awinic,aw882xx_smartpa nodes in the stock Android device tree.
+
 config SND_SOC_AW88395_LIB
 	select CRC8
 	tristate

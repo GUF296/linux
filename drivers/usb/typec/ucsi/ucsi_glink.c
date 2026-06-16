@@ -11,6 +11,7 @@
 #include <linux/soc/qcom/pdr.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/gpio/consumer.h>
+#include <linux/bitmap.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include "ucsi.h"
 
@@ -64,6 +65,11 @@ struct pmic_glink_ucsi {
 	struct device *dev;
 
 	struct gpio_desc *port_orientation[PMIC_GLINK_MAX_PORTS];
+	struct gpio_desc *c2_select;
+	struct gpio_desc *secondary_audio_detect;
+	bool connector_connected[PMIC_GLINK_MAX_PORTS];
+	bool audio_accessory_connected[PMIC_GLINK_MAX_PORTS];
+	u64 last_command;
 
 	struct pmic_glink_client *client;
 
@@ -80,6 +86,67 @@ struct pmic_glink_ucsi {
 
 	u8 read_buf[UCSI_BUF_V2_SIZE];
 };
+
+static void pmic_glink_ucsi_write_field(unsigned long *map,
+					struct ucsi_bitfield field,
+					u16 version, unsigned long value)
+{
+	if (version >= field.version)
+		bitmap_write(map, value, field.offset, field.size);
+}
+
+static unsigned long pmic_glink_ucsi_read_field(unsigned long *map,
+				       struct ucsi_bitfield field,
+				       u16 version)
+{
+	if (version < field.version)
+		return 0;
+
+	return bitmap_read(map, field.offset, field.size);
+}
+
+static void pmic_glink_ucsi_force_secondary_audio(struct pmic_glink_ucsi *ucsi,
+						 unsigned long *status)
+{
+	bool secondary_audio_present = false;
+	bool raw_audio_accessory;
+	unsigned long change, flags;
+	u8 idx = 1;
+
+	if (ucsi->secondary_audio_detect)
+		secondary_audio_present =
+			gpiod_get_value_cansleep(ucsi->secondary_audio_detect) > 0;
+
+	raw_audio_accessory =
+		pmic_glink_ucsi_read_field(status, UCSI_CONSTAT_PARTNER_TYPE,
+					       ucsi->ucsi->version) ==
+		UCSI_CONSTAT_PARTNER_TYPE_AUDIO;
+
+	if (raw_audio_accessory && secondary_audio_present)
+		ucsi->audio_accessory_connected[idx] = true;
+	else if (!secondary_audio_present)
+		ucsi->audio_accessory_connected[idx] = false;
+
+	if (!ucsi->audio_accessory_connected[idx] || !secondary_audio_present)
+		return;
+
+	change = pmic_glink_ucsi_read_field(status, UCSI_CONSTAT_CHANGE,
+					      ucsi->ucsi->version);
+	flags = pmic_glink_ucsi_read_field(status, UCSI_CONSTAT_PARTNER_FLAGS,
+					     ucsi->ucsi->version);
+
+	pmic_glink_ucsi_write_field(status, UCSI_CONSTAT_CONNECTED,
+				      ucsi->ucsi->version, 1);
+	pmic_glink_ucsi_write_field(status, UCSI_CONSTAT_CHANGE,
+				      ucsi->ucsi->version,
+				      change | UCSI_CONSTAT_CONNECT_CHANGE);
+	pmic_glink_ucsi_write_field(status, UCSI_CONSTAT_PARTNER_TYPE,
+				      ucsi->ucsi->version,
+				      UCSI_CONSTAT_PARTNER_TYPE_AUDIO);
+	pmic_glink_ucsi_write_field(status, UCSI_CONSTAT_PARTNER_FLAGS,
+				      ucsi->ucsi->version,
+				      flags | BIT(0));
+}
 
 static int pmic_glink_ucsi_read(struct ucsi *__ucsi, unsigned int offset,
 				void *val, size_t val_len)
@@ -129,9 +196,20 @@ static int pmic_glink_ucsi_read_cci(struct ucsi *ucsi, u32 *cci)
 	return pmic_glink_ucsi_read(ucsi, UCSI_CCI, cci, sizeof(*cci));
 }
 
-static int pmic_glink_ucsi_read_message_in(struct ucsi *ucsi, void *val, size_t val_len)
+static int pmic_glink_ucsi_read_message_in(struct ucsi *__ucsi, void *val, size_t val_len)
 {
-	return pmic_glink_ucsi_read(ucsi, UCSI_MESSAGE_IN, val, val_len);
+	struct pmic_glink_ucsi *ucsi = ucsi_get_drvdata(__ucsi);
+	int ret;
+
+	ret = pmic_glink_ucsi_read(__ucsi, UCSI_MESSAGE_IN, val, val_len);
+	if (ret)
+		return ret;
+
+	if (UCSI_COMMAND(ucsi->last_command) == UCSI_GET_CONNECTOR_STATUS &&
+	    UCSI_DEFAULT_GET_CONNECTOR_NUMBER(ucsi->last_command) == 2)
+		pmic_glink_ucsi_force_secondary_audio(ucsi, val);
+
+	return 0;
 }
 
 static int pmic_glink_ucsi_locked_write(struct pmic_glink_ucsi *ucsi, unsigned int offset,
@@ -187,6 +265,7 @@ static int pmic_glink_ucsi_async_control(struct ucsi *__ucsi, u64 command)
 	int ret;
 
 	mutex_lock(&ucsi->lock);
+	ucsi->last_command = command;
 	ret = pmic_glink_ucsi_locked_write(ucsi, UCSI_CONTROL, &command, sizeof(command));
 	mutex_unlock(&ucsi->lock);
 
@@ -207,9 +286,43 @@ static void pmic_glink_ucsi_update_connector(struct ucsi_connector *con)
 static void pmic_glink_ucsi_connector_status(struct ucsi_connector *con)
 {
 	struct pmic_glink_ucsi *ucsi = ucsi_get_drvdata(con->ucsi);
+	bool c1_connected, c2_connected, connected;
 	int orientation;
 
-	if (!UCSI_CONSTAT(con, CONNECTED)) {
+	if (con->num == 2)
+		pmic_glink_ucsi_force_secondary_audio(ucsi, con->status);
+
+	connected = UCSI_CONSTAT(con, CONNECTED);
+	if (con->num <= PMIC_GLINK_MAX_PORTS)
+		ucsi->connector_connected[con->num - 1] = connected;
+
+	if (ucsi->c2_select) {
+		c1_connected = ucsi->connector_connected[0];
+		c2_connected = ucsi->connector_connected[1];
+
+		if (c1_connected && !c2_connected) {
+			gpiod_set_value_cansleep(ucsi->c2_select, 0);
+		} else if (!c1_connected && c2_connected) {
+			gpiod_set_value_cansleep(ucsi->c2_select, 1);
+		}
+	}
+
+	dev_dbg(ucsi->dev,
+		"raw con%d connected=%d change=0x%lx type=%lu flags=0x%lx pwr_dir=%lu opmode=%lu c1=%d c2=%d\n",
+		con->num, connected,
+		pmic_glink_ucsi_read_field(con->status, UCSI_CONSTAT_CHANGE,
+					   con->ucsi->version),
+		pmic_glink_ucsi_read_field(con->status, UCSI_CONSTAT_PARTNER_TYPE,
+					   con->ucsi->version),
+		pmic_glink_ucsi_read_field(con->status, UCSI_CONSTAT_PARTNER_FLAGS,
+					   con->ucsi->version),
+		pmic_glink_ucsi_read_field(con->status, UCSI_CONSTAT_PWR_DIR,
+					   con->ucsi->version),
+		pmic_glink_ucsi_read_field(con->status, UCSI_CONSTAT_PWR_OPMODE,
+					   con->ucsi->version),
+		ucsi->connector_connected[0], ucsi->connector_connected[1]);
+
+	if (!connected) {
 		typec_set_orientation(con->port, TYPEC_ORIENTATION_NONE);
 		return;
 	}
@@ -371,6 +484,7 @@ static void pmic_glink_ucsi_destroy(void *data)
 static unsigned long quirk_sc8180x = UCSI_NO_PARTNER_PDOS;
 static unsigned long quirk_sc8280xp = UCSI_NO_PARTNER_PDOS | UCSI_DELAY_DEVICE_PDOS;
 static unsigned long quirk_sm8450 = UCSI_DELAY_DEVICE_PDOS;
+static unsigned long quirk_sm8650 = UCSI_DELAY_DEVICE_PDOS | UCSI_PRESERVE_ALTMODE_MUX;
 static unsigned long quirk_x1e80100 = UCSI_DELAY_DEVICE_PDOS | UCSI_USB4_IMPLIES_USB;
 
 static const struct of_device_id pmic_glink_ucsi_of_quirks[] = {
@@ -381,6 +495,7 @@ static const struct of_device_id pmic_glink_ucsi_of_quirks[] = {
 	{ .compatible = "qcom,sc8280xp-pmic-glink", .data = &quirk_sc8280xp, },
 	{ .compatible = "qcom,sm8350-pmic-glink", .data = &quirk_sc8180x, },
 	{ .compatible = "qcom,sm8450-pmic-glink", .data = &quirk_sm8450, },
+	{ .compatible = "qcom,sm8650-pmic-glink", .data = &quirk_sm8650, },
 	{ .compatible = "qcom,sm8550-pmic-glink", .data = &quirk_sm8450, },
 	{ .compatible = "qcom,x1e80100-pmic-glink", .data = &quirk_x1e80100, },
 	{}
@@ -422,6 +537,18 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
 		ucsi->ucsi->quirks = *(unsigned long *)match->data;
 
 	ucsi_set_drvdata(ucsi->ucsi, ucsi);
+
+	ucsi->c2_select = devm_gpiod_get_optional(dev, "c2-select",
+						  GPIOD_OUT_HIGH);
+	if (IS_ERR(ucsi->c2_select))
+		return dev_err_probe(dev, PTR_ERR(ucsi->c2_select),
+				     "unable to acquire C2 select gpio\n");
+
+	ucsi->secondary_audio_detect =
+		devm_gpiod_get_optional(dev, "secondary-audio-detect", GPIOD_IN);
+	if (IS_ERR(ucsi->secondary_audio_detect))
+		return dev_err_probe(dev, PTR_ERR(ucsi->secondary_audio_detect),
+				     "unable to acquire secondary audio detect gpio\n");
 
 	device_for_each_child_node_scoped(dev, fwnode) {
 		struct gpio_desc *desc;

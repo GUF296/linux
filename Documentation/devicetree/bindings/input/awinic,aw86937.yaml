@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/awinic,aw86937.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Awinic AW86937 LRA Haptic IC
+
+maintainers:
+  - Lenovo Y700 mainline port maintainers
+
+properties:
+  compatible:
+    oneOf:
+      - const: awinic,aw86937
+      - items:
+          - const: lenovo,tb321fu-aw86937
+          - const: awinic,aw86937
+
+  reg:
+    maxItems: 1
+
+  label:
+    description: Human-readable motor position label.
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        haptics@5a {
+            compatible = "lenovo,tb321fu-aw86937", "awinic,aw86937";
+            reg = <0x5a>;
+            label = "aw86937-haptics-right";
+        };
+    };

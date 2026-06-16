@@ -95,6 +95,7 @@
 #define		RDI_CFG1_CROP_H_EN		BIT(7)
 #define		RDI_CFG1_CROP_V_EN		BIT(8)
 #define		RDI_CFG1_PIX_STORE		BIT(10)
+#define		RDI_CFG1_PLAIN_FORMAT		12
 #define		RDI_CFG1_PACKING_FORMAT_MIPI	BIT(15)
 
 #define CSID_RDI_IRQ_SUBSAMPLE_PATTERN(rdi)	(csid_is_lite(csid) && IS_CSID_690(csid) ?\
@@ -145,15 +146,22 @@ static void __csid_configure_wrapper(struct csid_device *csid)
 	writel(val, csid->camss->csid_wrapper_base + CSID_IO_PATH_CFG0(csid->id));
 }
 
+static bool csid_gen3_rdi_plain16_code(u32 code)
+{
+	return code == MEDIA_BUS_FMT_SBGGR10_2X8_PADHI_LE;
+}
+
 static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8 vc)
 {
 	u32 val;
+	u32 decode_format;
 	u8 lane_cnt = csid->phy.lane_cnt;
 	/* Source pads matching RDI channels on hardware. Pad 1 -> RDI0, Pad 2 -> RDI1, etc. */
 	struct v4l2_mbus_framefmt *input_format = &csid->fmt[MSM_CSID_PAD_FIRST_SRC + vc];
 	const struct csid_format_info *format = csid_get_fmt_entry(csid->res->formats->formats,
-								   csid->res->formats->nformats,
-								   input_format->code);
+									   csid->res->formats->nformats,
+									   input_format->code);
+	bool plain16 = csid_gen3_rdi_plain16_code(input_format->code);
 
 	if (!lane_cnt)
 		lane_cnt = 4;
@@ -174,15 +182,19 @@ static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8 
 
 	val = RDI_CFG0_TIMESTAMP_EN;
 	val |= RDI_CFG0_TIMESTAMP_STB_SEL;
-	/* note: for non-RDI path, this should be format->decode_format */
-	val |= DECODE_FORMAT_PAYLOAD_ONLY << RDI_CFG0_DECODE_FORMAT;
+	decode_format = plain16 ? format->decode_format : DECODE_FORMAT_PAYLOAD_ONLY;
+	val |= decode_format << RDI_CFG0_DECODE_FORMAT;
 	val |= vc << RDI_CFG0_VC;
 	val |= format->data_type << RDI_CFG0_DT;
 	val |= dt_id << RDI_CFG0_DT_ID;
 
 	writel(val, csid->base + CSID_RDI_CFG0(vc));
 
-	val = RDI_CFG1_PACKING_FORMAT_MIPI;
+	val = plain16 ? 0 : RDI_CFG1_PACKING_FORMAT_MIPI;
+	if (plain16) {
+		val |= PLAIN_FORMAT_PLAIN16 << RDI_CFG1_PLAIN_FORMAT;
+		/* Keep bit 11 clear for the validated LSB-aligned Plain16 path. */
+	}
 	val |= RDI_CFG1_PIX_STORE;
 	val |= RDI_CFG1_DROP_H_EN;
 	val |= RDI_CFG1_DROP_V_EN;

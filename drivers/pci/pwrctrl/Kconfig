@@ -8,6 +8,7 @@ config PCI_PWRCTRL
 
 config PCI_PWRCTRL_PWRSEQ
 	tristate
+	default y if ARCH_QCOM
 	select POWER_SEQUENCING
 	select PCI_PWRCTRL
 

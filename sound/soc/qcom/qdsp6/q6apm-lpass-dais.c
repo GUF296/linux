@@ -3,6 +3,7 @@
 
 #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 #include <linux/err.h>
+#include <linux/clk.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/device.h>
@@ -17,12 +18,37 @@
 #include "q6apm.h"
 
 #define AUDIOREACH_BE_PCM_BASE	16
+#define Y700_SEC_TDM_BCLK_RATE	12288000
 
 struct q6apm_lpass_dai_data {
 	struct q6apm_graph *graph[APM_PORT_MAX];
 	bool is_port_started[APM_PORT_MAX];
 	struct audioreach_module_config module_config[APM_PORT_MAX];
+	struct clk *sec_tdm_ibit_clk;
+	struct clk *sec_tdm_ebit_clk;
+	struct clk *sec_mi2s_ibit_clk;
+	struct clk *sec_mi2s_ebit_clk;
+	struct clk *lpass_macro_clk;
+	struct clk *lpass_dcodec_clk;
+	bool sec_tdm_clks_enabled;
 };
+
+static struct clk *q6apm_lpass_y700_sec_ibit_clk(struct q6apm_lpass_dai_data *dai_data,
+						 int dai_id)
+{
+	if (dai_id == SECONDARY_MI2S_RX)
+		return dai_data->sec_mi2s_ibit_clk;
+
+	return dai_data->sec_tdm_ibit_clk;
+}
+
+static const char *q6apm_lpass_y700_sec_clk_name(int dai_id)
+{
+	if (dai_id == SECONDARY_MI2S_RX)
+		return "SEC MI2S";
+
+	return "SEC TDM";
+}
 
 static int q6dma_set_channel_map(struct snd_soc_dai *dai,
 				 unsigned int tx_num,
@@ -95,6 +121,208 @@ static int q6dma_set_channel_map(struct snd_soc_dai *dai,
 	return 0;
 }
 
+static int q6tdm_set_tdm_slot(struct snd_soc_dai *dai,
+			      unsigned int tx_mask,
+			      unsigned int rx_mask,
+			      int slots, int slot_width)
+{
+	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
+	unsigned int cap_mask;
+
+	if (slot_width != 16 && slot_width != 32) {
+		dev_err(dai->dev, "%s: invalid slot_width %d\n",
+			__func__, slot_width);
+		return -EINVAL;
+	}
+
+	switch (slots) {
+	case 2:
+		cap_mask = 0x03;
+		break;
+	case 4:
+		cap_mask = 0x0f;
+		break;
+	case 8:
+		cap_mask = 0xff;
+		break;
+	case 16:
+		cap_mask = 0xffff;
+		break;
+	default:
+		dev_err(dai->dev, "%s: invalid slots %d\n", __func__, slots);
+		return -EINVAL;
+	}
+
+	if (dai->id < PRIMARY_TDM_RX_0 || dai->id > QUINARY_TDM_TX_7) {
+		dev_err(dai->dev, "%s: invalid dai id 0x%x\n",
+			__func__, dai->id);
+		return -EINVAL;
+	}
+
+	if (dai->id & 0x1)
+		tx_mask &= cap_mask;
+	else
+		rx_mask &= cap_mask;
+
+	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX)
+		cfg->frame_size_factor = 1;
+	else
+		cfg->frame_size_factor = slots;
+	cfg->sd_line_mask = (dai->id & 0x1) ? tx_mask : rx_mask;
+
+	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX)
+		dev_info(dai->dev,
+			 "Y700 TDM slot: dai=%d tx=0x%x rx=0x%x slots=%d slot_width=%d frame_size_factor=%u sd_line_mask=0x%x\n",
+			 dai->id, tx_mask, rx_mask, slots, slot_width,
+			 cfg->frame_size_factor, cfg->sd_line_mask);
+
+	return 0;
+}
+
+static int q6i2s_set_tdm_slot(struct snd_soc_dai *dai,
+			      unsigned int tx_mask,
+			      unsigned int rx_mask,
+			      int slots, int slot_width)
+{
+	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
+	unsigned int cap_mask;
+
+	if (dai->id != SECONDARY_MI2S_RX)
+		return -ENOTSUPP;
+
+	if (slot_width != 16 && slot_width != 32) {
+		dev_err(dai->dev, "%s: invalid slot_width %d\n",
+			__func__, slot_width);
+		return -EINVAL;
+	}
+
+	switch (slots) {
+	case 2:
+		cap_mask = 0x03;
+		break;
+	case 4:
+		cap_mask = 0x0f;
+		break;
+	case 8:
+		cap_mask = 0xff;
+		break;
+	case 16:
+		cap_mask = 0xffff;
+		break;
+	default:
+		dev_err(dai->dev, "%s: invalid slots %d\n", __func__, slots);
+		return -EINVAL;
+	}
+
+	cfg->frame_size_factor = 1;
+	cfg->sd_line_mask = rx_mask & cap_mask;
+
+	dev_info(dai->dev,
+		 "Y700 I2S slot: dai=%d tx=0x%x rx=0x%x slots=%d slot_width=%d frame_size_factor=%u sd_line_mask=0x%x\n",
+		 dai->id, tx_mask, rx_mask, slots, slot_width,
+		 cfg->frame_size_factor, cfg->sd_line_mask);
+
+	return 0;
+}
+
+static int q6tdm_set_channel_map(struct snd_soc_dai *dai,
+				 unsigned int tx_num, const unsigned int *tx_slot,
+				 unsigned int rx_num, const unsigned int *rx_slot)
+{
+	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
+	unsigned int num;
+	const unsigned int *slot;
+
+	if (dai->id < PRIMARY_TDM_RX_0 || dai->id > QUINARY_TDM_TX_7) {
+		dev_err(dai->dev, "%s: invalid dai id 0x%x\n",
+			__func__, dai->id);
+		return -EINVAL;
+	}
+
+	if (dai->id & 0x1) {
+		num = tx_num;
+		slot = tx_slot;
+	} else {
+		num = rx_num;
+		slot = rx_slot;
+	}
+
+	if (!slot) {
+		dev_err(dai->dev, "%s: slot map not found\n", __func__);
+		return -EINVAL;
+	}
+
+	if (num > AR_PCM_MAX_NUM_CHANNEL) {
+		dev_err(dai->dev, "%s: invalid channel count %u\n",
+			__func__, num);
+		return -EINVAL;
+	}
+
+	/*
+	 * The TDM slot offsets describe placement on the physical frame, not
+	 * PCM channel identities. Keep the media-format channel map valid for
+	 * modules such as MFC; slot placement is carried separately through the
+	 * TDM endpoint configuration.
+	 */
+	audioreach_set_default_channel_mapping(cfg->channel_map, num);
+
+	cfg->num_channels = num;
+	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX)
+		dev_info(dai->dev,
+			 "Y700 TDM chmap: dai=%d num=%u pcm-map=%u,%u,%u,%u,%u,%u,%u,%u slot=%u,%u,%u,%u,%u,%u,%u,%u\n",
+			 dai->id, cfg->num_channels,
+			 cfg->channel_map[0], cfg->channel_map[1],
+			 cfg->channel_map[2], cfg->channel_map[3],
+			 cfg->channel_map[4], cfg->channel_map[5],
+			 cfg->channel_map[6], cfg->channel_map[7],
+			 slot[0], slot[1], slot[2], slot[3],
+			 slot[4], slot[5], slot[6], slot[7]);
+
+	return 0;
+}
+
+static int q6i2s_set_channel_map(struct snd_soc_dai *dai,
+				 unsigned int tx_num, const unsigned int *tx_slot,
+				 unsigned int rx_num, const unsigned int *rx_slot)
+{
+	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
+	unsigned int i;
+
+	if (dai->id != SECONDARY_MI2S_RX)
+		return q6dma_set_channel_map(dai, tx_num, tx_slot,
+					     rx_num, rx_slot);
+
+	if (rx_num > AR_PCM_MAX_NUM_CHANNEL) {
+		dev_err(dai->dev, "%s: invalid channel count %u\n",
+			__func__, rx_num);
+		return -EINVAL;
+	}
+
+	audioreach_set_default_channel_mapping(cfg->channel_map, rx_num);
+	cfg->num_channels = rx_num;
+
+	dev_info(dai->dev,
+		 "Y700 I2S chmap: dai=%d num=%u pcm-map=%u,%u,%u,%u,%u,%u,%u,%u slot=%u,%u,%u,%u,%u,%u,%u,%u\n",
+		 dai->id, cfg->num_channels,
+		 cfg->channel_map[0], cfg->channel_map[1],
+		 cfg->channel_map[2], cfg->channel_map[3],
+		 cfg->channel_map[4], cfg->channel_map[5],
+		 cfg->channel_map[6], cfg->channel_map[7],
+		 rx_slot ? rx_slot[0] : 0, rx_slot ? rx_slot[1] : 0,
+		 rx_slot ? rx_slot[2] : 0, rx_slot ? rx_slot[3] : 0,
+		 rx_slot ? rx_slot[4] : 0, rx_slot ? rx_slot[5] : 0,
+		 rx_slot ? rx_slot[6] : 0, rx_slot ? rx_slot[7] : 0);
+
+	for (i = rx_num; i < AR_PCM_MAX_NUM_CHANNEL; i++)
+		cfg->channel_map[i] = 0;
+
+	return 0;
+}
+
 static int q6hdmi_hw_params(struct snd_pcm_substream *substream,
 			    struct snd_pcm_hw_params *params, struct snd_soc_dai *dai)
 {
@@ -141,6 +369,29 @@ static int q6dma_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+static int q6tdm_hw_params(struct snd_pcm_substream *substream,
+			   struct snd_pcm_hw_params *params,
+			   struct snd_soc_dai *dai)
+{
+	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
+	int channels = params_channels(params);
+
+	cfg->bit_width = params_width(params);
+	cfg->sample_rate = params_rate(params);
+	cfg->num_channels = channels;
+
+	if (dai->id == SECONDARY_TDM_RX_0)
+		dev_info(dai->dev,
+			 "Y700 TDM hw_params: dai=%d rate=%u channels=%u params_fmt=%d width=%u cfg_bw=%u fsf=%u sd_mask=0x%x\n",
+			 dai->id, cfg->sample_rate, cfg->num_channels,
+			 params_format(params), params_width(params),
+			 cfg->bit_width, cfg->frame_size_factor,
+			 cfg->sd_line_mask);
+
+	return 0;
+}
+
 static void q6apm_lpass_dai_shutdown(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
 {
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
@@ -157,6 +408,74 @@ static void q6apm_lpass_dai_shutdown(struct snd_pcm_substream *substream, struct
 		q6apm_graph_close(dai_data->graph[dai->id]);
 		dai_data->graph[dai->id] = NULL;
 	}
+
+	if ((dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX) &&
+	    dai_data->sec_tdm_clks_enabled) {
+		struct clk *ibit_clk = q6apm_lpass_y700_sec_ibit_clk(dai_data, dai->id);
+
+		if (ibit_clk)
+			clk_disable_unprepare(ibit_clk);
+		dai_data->sec_tdm_clks_enabled = false;
+		dev_info(dai->dev, "Y700 %s ibit clock disabled\n",
+			 q6apm_lpass_y700_sec_clk_name(dai->id));
+	}
+}
+
+static int q6apm_lpass_enable_sec_tdm_clks(struct snd_soc_dai *dai)
+{
+	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	struct clk *ibit_clk = q6apm_lpass_y700_sec_ibit_clk(dai_data, dai->id);
+	int ret;
+
+	if (dai_data->sec_tdm_clks_enabled)
+		return 0;
+
+	if (dai_data->sec_tdm_ibit_clk) {
+		ret = clk_set_rate(dai_data->sec_tdm_ibit_clk,
+				   Y700_SEC_TDM_BCLK_RATE);
+		if (ret)
+			dev_warn(dai->dev,
+				 "Y700 TDM ibit clk_set_rate failed: %d\n",
+				 ret);
+	}
+
+	if (dai_data->sec_tdm_ebit_clk) {
+		ret = clk_set_rate(dai_data->sec_tdm_ebit_clk,
+				   Y700_SEC_TDM_BCLK_RATE);
+		if (ret)
+			dev_warn(dai->dev,
+				 "Y700 TDM ebit clk_set_rate failed: %d\n",
+				 ret);
+	}
+
+	if (dai_data->sec_mi2s_ibit_clk) {
+		ret = clk_set_rate(dai_data->sec_mi2s_ibit_clk,
+				   Y700_SEC_TDM_BCLK_RATE);
+		if (ret)
+			dev_warn(dai->dev,
+				 "Y700 SEC MI2S ibit clk_set_rate failed: %d\n",
+				 ret);
+	}
+
+	if (dai_data->sec_mi2s_ebit_clk) {
+		ret = clk_set_rate(dai_data->sec_mi2s_ebit_clk,
+				   Y700_SEC_TDM_BCLK_RATE);
+		if (ret)
+			dev_warn(dai->dev,
+				 "Y700 SEC MI2S ebit clk_set_rate failed: %d\n",
+				 ret);
+	}
+
+	ret = ibit_clk ? clk_prepare_enable(ibit_clk) : 0;
+	if (ret)
+		return ret;
+
+	dai_data->sec_tdm_clks_enabled = true;
+	dev_info(dai->dev, "Y700 %s ibit clock enabled: %u Hz\n",
+		 q6apm_lpass_y700_sec_clk_name(dai->id),
+		 Y700_SEC_TDM_BCLK_RATE);
+
+	return 0;
 }
 
 static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
@@ -172,7 +491,8 @@ static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
 		if (!dai_data->is_port_started[dai->id]) {
 			ret = q6apm_graph_start(dai_data->graph[dai->id]);
 			if (ret < 0)
-				dev_err(dai->dev, "Failed to start APM port %d\n", dai->id);
+				dev_err(dai->dev, "Failed to start APM port %d\n",
+					dai->id);
 			else
 				dai_data->is_port_started[dai->id] = true;
 		}
@@ -191,6 +511,12 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 	struct q6apm_graph *graph;
 	int graph_id = dai->id;
 	int rc;
+
+	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX) {
+		rc = q6apm_lpass_enable_sec_tdm_clks(dai);
+		if (rc)
+			return rc;
+	}
 
 	if (dai_data->is_port_started[dai->id]) {
 		q6apm_graph_stop(dai_data->graph[dai->id]);
@@ -213,6 +539,13 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 	}
 
 	cfg->direction = substream->stream;
+	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX)
+		dev_info(dai->dev,
+			 "Y700 TDM prepare: dai=%d graph=%d dir=%d rate=%u channels=%u bw=%u fmt=0x%x fsf=%u sd_mask=0x%x\n",
+			 dai->id, graph_id, cfg->direction, cfg->sample_rate,
+			 cfg->num_channels, cfg->bit_width, cfg->fmt,
+			 cfg->frame_size_factor, cfg->sd_line_mask);
+
 	rc = q6apm_graph_media_format_pcm(dai_data->graph[dai->id], cfg);
 	if (rc) {
 		dev_err(dai->dev, "Failed to set media format %d\n", rc);
@@ -224,6 +557,7 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 		dev_err(dai->dev, "Failed to prepare Graph %d\n", rc);
 		goto err;
 	}
+
 	return 0;
 err:
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
@@ -238,6 +572,13 @@ static int q6apm_lpass_dai_startup(struct snd_pcm_substream *substream, struct s
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
 	struct q6apm_graph *graph;
 	int graph_id = dai->id;
+	int rc;
+
+	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX) {
+		rc = q6apm_lpass_enable_sec_tdm_clks(dai);
+		if (rc)
+			return rc;
+	}
 
 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
 		graph = q6apm_graph_open(dai->dev, NULL, dai->dev, graph_id, substream->stream);
@@ -274,8 +615,20 @@ static const struct snd_soc_dai_ops q6i2s_ops = {
 	.prepare	= q6apm_lpass_dai_prepare,
 	.startup	= q6apm_lpass_dai_startup,
 	.shutdown	= q6apm_lpass_dai_shutdown,
-	.set_channel_map  = q6dma_set_channel_map,
+	.set_channel_map  = q6i2s_set_channel_map,
+	.set_tdm_slot	= q6i2s_set_tdm_slot,
 	.hw_params        = q6dma_hw_params,
+	.set_fmt	= q6i2s_set_fmt,
+	.trigger	= q6apm_lpass_dai_trigger,
+};
+
+static const struct snd_soc_dai_ops q6tdm_ops = {
+	.prepare	= q6apm_lpass_dai_prepare,
+	.startup	= q6apm_lpass_dai_startup,
+	.shutdown	= q6apm_lpass_dai_shutdown,
+	.set_channel_map = q6tdm_set_channel_map,
+	.set_tdm_slot	= q6tdm_set_tdm_slot,
+	.hw_params	= q6tdm_hw_params,
 	.set_fmt	= q6i2s_set_fmt,
 	.trigger	= q6apm_lpass_dai_trigger,
 };
@@ -309,10 +662,41 @@ static int q6apm_lpass_dai_dev_probe(struct platform_device *pdev)
 	if (!dai_data)
 		return -ENOMEM;
 
+	dai_data->sec_tdm_ibit_clk = devm_clk_get_optional(dev,
+							   "sec-tdm-ibit");
+	if (IS_ERR(dai_data->sec_tdm_ibit_clk))
+		return PTR_ERR(dai_data->sec_tdm_ibit_clk);
+
+	dai_data->sec_tdm_ebit_clk = devm_clk_get_optional(dev,
+							   "sec-tdm-ebit");
+	if (IS_ERR(dai_data->sec_tdm_ebit_clk))
+		return PTR_ERR(dai_data->sec_tdm_ebit_clk);
+
+	dai_data->sec_mi2s_ibit_clk = devm_clk_get_optional(dev,
+							    "sec-mi2s-ibit");
+	if (IS_ERR(dai_data->sec_mi2s_ibit_clk))
+		return PTR_ERR(dai_data->sec_mi2s_ibit_clk);
+
+	dai_data->sec_mi2s_ebit_clk = devm_clk_get_optional(dev,
+							    "sec-mi2s-ebit");
+	if (IS_ERR(dai_data->sec_mi2s_ebit_clk))
+		return PTR_ERR(dai_data->sec_mi2s_ebit_clk);
+
+	dai_data->lpass_macro_clk = devm_clk_get_optional(dev,
+							  "lpass-macro");
+	if (IS_ERR(dai_data->lpass_macro_clk))
+		return PTR_ERR(dai_data->lpass_macro_clk);
+
+	dai_data->lpass_dcodec_clk = devm_clk_get_optional(dev,
+							   "lpass-dcodec");
+	if (IS_ERR(dai_data->lpass_dcodec_clk))
+		return PTR_ERR(dai_data->lpass_dcodec_clk);
+
 	dev_set_drvdata(dev, dai_data);
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.q6i2s_ops = &q6i2s_ops;
+	cfg.q6tdm_ops = &q6tdm_ops;
 	cfg.q6dma_ops = &q6dma_ops;
 	cfg.q6hdmi_ops = &q6hdmi_ops;
 	dais = q6dsp_audio_ports_set_config(dev, &cfg, &num_dais);

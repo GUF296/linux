@@ -18,7 +18,36 @@ struct ptn3222 {
 	struct phy *phy;
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data *supplies;
+	u8 *param_override;
+	int param_override_len;
 };
+
+static int ptn3222_write_param_override(struct ptn3222 *ptn3222)
+{
+	struct device *dev = &ptn3222->client->dev;
+	int i, ret;
+
+	if (!ptn3222->param_override_len)
+		return 0;
+
+	if (ptn3222->param_override_len % 2) {
+		dev_warn(dev, "ignoring odd param override length %d\n",
+			 ptn3222->param_override_len);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < ptn3222->param_override_len; i += 2) {
+		ret = i2c_smbus_write_byte_data(ptn3222->client,
+						ptn3222->param_override[i],
+						ptn3222->param_override[i + 1]);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to write override reg 0x%02x\n",
+					     ptn3222->param_override[i]);
+	}
+
+	return 0;
+}
 
 static int ptn3222_init(struct phy *phy)
 {
@@ -31,7 +60,9 @@ static int ptn3222_init(struct phy *phy)
 
 	gpiod_set_value_cansleep(ptn3222->reset_gpio, 0);
 
-	return 0;
+	usleep_range(1000, 2000);
+
+	return ptn3222_write_param_override(ptn3222);
 }
 
 static int ptn3222_exit(struct phy *phy)
@@ -82,6 +113,26 @@ static int ptn3222_probe(struct i2c_client *client)
 					    &ptn3222->supplies);
 	if (ret)
 		return ret;
+
+	ptn3222->param_override_len =
+		of_property_count_u8_elems(dev->of_node,
+					   "qcom,param-override-seq-c1");
+	if (ptn3222->param_override_len > 0) {
+		ptn3222->param_override = devm_kmalloc(dev,
+						       ptn3222->param_override_len,
+						       GFP_KERNEL);
+		if (!ptn3222->param_override)
+			return -ENOMEM;
+
+		ret = of_property_read_u8_array(dev->of_node,
+						"qcom,param-override-seq-c1",
+						ptn3222->param_override,
+						ptn3222->param_override_len);
+		if (ret)
+			return ret;
+	} else if (ptn3222->param_override_len != -EINVAL) {
+		return ptn3222->param_override_len;
+	}
 
 	ptn3222->phy = devm_phy_create(dev, dev->of_node, &ptn3222_ops);
 	if (IS_ERR(ptn3222->phy)) {
