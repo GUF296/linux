@@ -197,6 +197,7 @@ struct wcd939x_usbss {
 	enum typec_orientation orientation;
 	unsigned long mode;
 	unsigned int svid;
+	bool virtual_only;
 };
 
 static const struct regmap_range_cfg wcd939x_usbss_ranges[] = {
@@ -244,6 +245,9 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
 	bool enable_usb = false;
 	bool enable_dp = false;
 	int ret;
+
+	if (usbss->virtual_only)
+		return 0;
 
 	/* USB Mode */
 	if (usbss->mode < TYPEC_STATE_MODAL ||
@@ -540,6 +544,9 @@ static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
 	mutex_lock(&usbss->lock);
 
 	if (usbss->orientation != orientation) {
+		dev_dbg(&usbss->client->dev,
+			"switch orientation %u -> %u virtual=%d\n",
+			usbss->orientation, orientation, usbss->virtual_only);
 		usbss->orientation = orientation;
 
 		ret = wcd939x_usbss_set(usbss);
@@ -551,7 +558,16 @@ static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
 		return ret;
 
 	/* Report orientation to codec after switch has been done */
-	return typec_switch_set(usbss->codec_switch, orientation);
+	if (!usbss->codec_switch)
+		dev_dbg(&usbss->client->dev,
+			"codec switch handle is NULL; orientation event is no-op\n");
+
+	ret = typec_switch_set(usbss->codec_switch, orientation);
+	dev_dbg(&usbss->client->dev,
+		"forward codec switch handle=%p ret=%d\n",
+		usbss->codec_switch, ret);
+
+	return ret;
 }
 
 static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
@@ -563,6 +579,10 @@ static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
 	mutex_lock(&usbss->lock);
 
 	if (usbss->mode != state->mode) {
+		dev_dbg(&usbss->client->dev,
+			"mux mode 0x%lx -> 0x%lx svid 0x%x virtual=%d\n",
+			usbss->mode, state->mode,
+			state->alt ? state->alt->svid : 0, usbss->virtual_only);
 		usbss->mode = state->mode;
 
 		if (state->alt)
@@ -579,7 +599,15 @@ static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
 		return ret;
 
 	/* Report event to codec after switch has been done */
-	return typec_mux_set(usbss->codec, state);
+	if (!usbss->codec)
+		dev_dbg(&usbss->client->dev,
+			"codec mux handle is NULL; mode event is no-op\n");
+
+	ret = typec_mux_set(usbss->codec, state);
+	dev_dbg(&usbss->client->dev,
+		"forward codec mux handle=%p ret=%d\n", usbss->codec, ret);
+
+	return ret;
 }
 
 static int wcd939x_usbss_probe(struct i2c_client *client)
@@ -596,25 +624,30 @@ static int wcd939x_usbss_probe(struct i2c_client *client)
 
 	usbss->client = client;
 	mutex_init(&usbss->lock);
+	usbss->virtual_only = device_property_read_bool(dev, "qcom,virtual-usbss");
 
-	usbss->regmap = devm_regmap_init_i2c(client, &wcd939x_usbss_regmap_config);
-	if (IS_ERR(usbss->regmap))
-		return dev_err_probe(dev, PTR_ERR(usbss->regmap), "failed to initialize regmap\n");
+	if (!usbss->virtual_only) {
+		usbss->regmap = devm_regmap_init_i2c(client, &wcd939x_usbss_regmap_config);
+		if (IS_ERR(usbss->regmap))
+			return dev_err_probe(dev, PTR_ERR(usbss->regmap), "failed to initialize regmap\n");
 
-	usbss->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(usbss->reset_gpio))
-		return dev_err_probe(dev, PTR_ERR(usbss->reset_gpio),
-				     "unable to acquire reset gpio\n");
+		usbss->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+		if (IS_ERR(usbss->reset_gpio))
+			return dev_err_probe(dev, PTR_ERR(usbss->reset_gpio),
+					     "unable to acquire reset gpio\n");
 
-	usbss->vdd_supply = devm_regulator_get_optional(dev, "vdd");
-	if (IS_ERR(usbss->vdd_supply))
-		return PTR_ERR(usbss->vdd_supply);
+		usbss->vdd_supply = devm_regulator_get_optional(dev, "vdd");
+		if (IS_ERR(usbss->vdd_supply))
+			return PTR_ERR(usbss->vdd_supply);
+	}
 
 	/* Get Codec's MUX & Switch devices */
 	usbss->codec = fwnode_typec_mux_get(dev->fwnode);
 	if (IS_ERR(usbss->codec))
 		return dev_err_probe(dev, PTR_ERR(usbss->codec),
 				     "failed to acquire codec mode-switch\n");
+	dev_dbg(dev, "acquired codec mode-switch handle=%p virtual=%d\n",
+		usbss->codec, usbss->virtual_only);
 
 	usbss->codec_switch = fwnode_typec_switch_get(dev->fwnode);
 	if (IS_ERR(usbss->codec_switch)) {
@@ -622,9 +655,14 @@ static int wcd939x_usbss_probe(struct i2c_client *client)
 				    "failed to acquire codec orientation-switch\n");
 		goto err_mux_put;
 	}
+	dev_dbg(dev, "acquired codec orientation-switch handle=%p virtual=%d\n",
+		usbss->codec_switch, usbss->virtual_only);
 
 	usbss->mode = TYPEC_STATE_SAFE;
 	usbss->orientation = TYPEC_ORIENTATION_NONE;
+
+	if (usbss->virtual_only)
+		goto register_muxes;
 
 	gpiod_set_value(usbss->reset_gpio, 1);
 
@@ -700,6 +738,7 @@ static int wcd939x_usbss_probe(struct i2c_client *client)
 	if (ret)
 		goto err_regulator_disable;
 
+register_muxes:
 	sw_desc.drvdata = usbss;
 	sw_desc.fwnode = dev_fwnode(dev);
 	sw_desc.set = wcd939x_usbss_switch_set;
@@ -719,6 +758,8 @@ static int wcd939x_usbss_probe(struct i2c_client *client)
 		ret = dev_err_probe(dev, PTR_ERR(usbss->mux), "failed to register typec mux\n");
 		goto err_switch_unregister;
 	}
+	dev_dbg(dev, "registered local mux/switch virtual=%d\n",
+		usbss->virtual_only);
 
 	i2c_set_clientdata(client, usbss);
 
@@ -728,7 +769,8 @@ err_switch_unregister:
 	typec_switch_unregister(usbss->sw);
 
 err_regulator_disable:
-	regulator_disable(usbss->vdd_supply);
+	if (!usbss->virtual_only)
+		regulator_disable(usbss->vdd_supply);
 
 err_mux_switch:
 	typec_switch_put(usbss->codec_switch);
@@ -746,7 +788,8 @@ static void wcd939x_usbss_remove(struct i2c_client *client)
 	typec_mux_unregister(usbss->mux);
 	typec_switch_unregister(usbss->sw);
 
-	regulator_disable(usbss->vdd_supply);
+	if (!usbss->virtual_only)
+		regulator_disable(usbss->vdd_supply);
 
 	typec_switch_put(usbss->codec_switch);
 	typec_mux_put(usbss->codec);

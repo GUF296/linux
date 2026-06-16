@@ -60,6 +60,9 @@ static int ucsi_psy_get_status(struct ucsi_connector *con,
 
 	val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 
+	if (UCSI_CONSTAT(con, PARTNER_TYPE) == UCSI_CONSTAT_PARTNER_TYPE_AUDIO)
+		return 0;
+
 	if (con->ucsi->version >= UCSI_VERSION_2_0)
 		sink_path_enabled =
 			UCSI_CONSTAT(con, SINK_PATH_STATUS_V2_0) ==
@@ -79,6 +82,9 @@ static int ucsi_psy_get_online(struct ucsi_connector *con,
 			       union power_supply_propval *val)
 {
 	val->intval = UCSI_PSY_OFFLINE;
+	if (UCSI_CONSTAT(con, PARTNER_TYPE) == UCSI_CONSTAT_PARTNER_TYPE_AUDIO)
+		return 0;
+
 	if (UCSI_CONSTAT(con, CONNECTED) &&
 	    (UCSI_CONSTAT(con, PWR_DIR) == TYPEC_SINK))
 		val->intval = UCSI_PSY_FIXED_ONLINE;
@@ -89,6 +95,11 @@ static int ucsi_psy_get_voltage_min(struct ucsi_connector *con,
 				    union power_supply_propval *val)
 {
 	u32 pdo;
+
+	if (UCSI_CONSTAT(con, PARTNER_TYPE) == UCSI_CONSTAT_PARTNER_TYPE_AUDIO) {
+		val->intval = 0;
+		return 0;
+	}
 
 	switch (UCSI_CONSTAT(con, PWR_OPMODE)) {
 	case UCSI_CONSTAT_PWR_OPMODE_PD:
@@ -113,6 +124,11 @@ static int ucsi_psy_get_voltage_max(struct ucsi_connector *con,
 {
 	u32 pdo;
 	int max_voltage = 0;
+
+	if (UCSI_CONSTAT(con, PARTNER_TYPE) == UCSI_CONSTAT_PARTNER_TYPE_AUDIO) {
+		val->intval = 0;
+		return 0;
+	}
 
 	switch (UCSI_CONSTAT(con, PWR_OPMODE)) {
 	case UCSI_CONSTAT_PWR_OPMODE_PD:
@@ -146,6 +162,11 @@ static int ucsi_psy_get_voltage_now(struct ucsi_connector *con,
 	int index;
 	u32 pdo;
 
+	if (UCSI_CONSTAT(con, PARTNER_TYPE) == UCSI_CONSTAT_PARTNER_TYPE_AUDIO) {
+		val->intval = 0;
+		return 0;
+	}
+
 	switch (UCSI_CONSTAT(con, PWR_OPMODE)) {
 	case UCSI_CONSTAT_PWR_OPMODE_PD:
 		index = rdo_index(con->rdo);
@@ -175,7 +196,8 @@ static int ucsi_psy_get_current_max(struct ucsi_connector *con,
 	u32 pdo;
 	int max_current = 0;
 
-	if (!UCSI_CONSTAT(con, CONNECTED)) {
+	if (!UCSI_CONSTAT(con, CONNECTED) ||
+	    UCSI_CONSTAT(con, PARTNER_TYPE) == UCSI_CONSTAT_PARTNER_TYPE_AUDIO) {
 		val->intval = 0;
 		return 0;
 	}
@@ -212,7 +234,8 @@ static int ucsi_psy_get_current_max(struct ucsi_connector *con,
 static int ucsi_psy_get_current_now(struct ucsi_connector *con,
 				    union power_supply_propval *val)
 {
-	if (!UCSI_CONSTAT(con, CONNECTED)) {
+	if (!UCSI_CONSTAT(con, CONNECTED) ||
+	    UCSI_CONSTAT(con, PARTNER_TYPE) == UCSI_CONSTAT_PARTNER_TYPE_AUDIO) {
 		val->intval = 0;
 		return 0;
 	}
@@ -241,7 +264,8 @@ static int ucsi_psy_get_usb_type(struct ucsi_connector *con,
 				 union power_supply_propval *val)
 {
 	val->intval = POWER_SUPPLY_USB_TYPE_C;
-	if (UCSI_CONSTAT(con, CONNECTED) &&
+	if (UCSI_CONSTAT(con, PARTNER_TYPE) != UCSI_CONSTAT_PARTNER_TYPE_AUDIO &&
+	    UCSI_CONSTAT(con, CONNECTED) &&
 	    UCSI_CONSTAT(con, PWR_OPMODE) == UCSI_CONSTAT_PWR_OPMODE_PD)
 		val->intval = POWER_SUPPLY_USB_TYPE_PD;
 
@@ -251,6 +275,11 @@ static int ucsi_psy_get_usb_type(struct ucsi_connector *con,
 static int ucsi_psy_get_charge_type(struct ucsi_connector *con, union power_supply_propval *val)
 {
 	if (!(UCSI_CONSTAT(con, CONNECTED))) {
+		val->intval = POWER_SUPPLY_CHARGE_TYPE_NONE;
+		return 0;
+	}
+
+	if (UCSI_CONSTAT(con, PARTNER_TYPE) == UCSI_CONSTAT_PARTNER_TYPE_AUDIO) {
 		val->intval = POWER_SUPPLY_CHARGE_TYPE_NONE;
 		return 0;
 	}

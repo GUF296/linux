@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/regmap.h>
+#include <linux/delay.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/regulator/consumer.h>
@@ -31,6 +32,8 @@
 #define FSA4480_DELAY_L_SENSE	0x0f
 #define FSA4480_DELAY_L_AGND	0x10
 #define FSA4480_FUNCTION_ENABLE	0x12
+#define FSA4480_DET_STATUS	0x17
+#define FSA4480_SPECIAL_CFG	0x1c
 #define FSA4480_RESET		0x1e
 #define FSA4480_MAX_REGISTER	0x1f
 
@@ -76,6 +79,61 @@ static const struct regmap_config fsa4480_regmap_config = {
 	.disable_locking = true,
 };
 
+static int fsa4480_set_android_audio(struct fsa4480 *fsa)
+{
+	int ret, i, dev_id = 0, func = 0, det = 0, status = 0;
+
+	if (fsa->cur_enable & FSA4480_ENABLE_SBU) {
+		regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE,
+			     fsa->cur_enable & ~FSA4480_ENABLE_SBU);
+		usleep_range(35, 1000);
+	}
+
+	regmap_write(fsa->regmap, FSA4480_RESET, 0x01);
+	regmap_write(fsa->regmap, FSA4480_SLOW_L, 0x4f);
+	regmap_write(fsa->regmap, FSA4480_SLOW_R, 0x4f);
+	regmap_write(fsa->regmap, FSA4480_SLOW_MIC, 0x4f);
+	regmap_write(fsa->regmap, FSA4480_SLOW_SENSE, 0x4f);
+	regmap_write(fsa->regmap, FSA4480_SLOW_GND, 0x4f);
+
+	ret = regmap_read(fsa->regmap, FSA4480_DEVICE_ID, &dev_id);
+	if (!ret && dev_id == 0xf1)
+		regmap_write(fsa->regmap, FSA4480_SPECIAL_CFG, 0x00);
+
+	regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, 0x9f);
+	regmap_write(fsa->regmap, FSA4480_SWITCH_SELECT, 0x00);
+	regmap_write(fsa->regmap, FSA4480_FUNCTION_ENABLE, 0x0d);
+
+	for (i = 0; i < 20; i++) {
+		ret = regmap_read(fsa->regmap, FSA4480_FUNCTION_ENABLE, &func);
+		if (!ret && func == 0x0c)
+			break;
+		usleep_range(1000, 2000);
+	}
+
+	msleep(1000);
+
+	regmap_read(fsa->regmap, FSA4480_DET_STATUS, &det);
+	regmap_read(fsa->regmap, FSA4480_SWITCH_STATUS1, &status);
+
+	if (det == 0x01 || status == 0x05) {
+		regmap_write(fsa->regmap, FSA4480_RESET, 0x01);
+		regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, 0x80);
+		regmap_write(fsa->regmap, FSA4480_SWITCH_SELECT, 0x00);
+		usleep_range(1000, 2000);
+		regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, 0x9f);
+	} else if (det == 0x02) {
+		regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, 0x87);
+		regmap_write(fsa->regmap, FSA4480_SWITCH_SELECT, 0x07);
+		usleep_range(1000, 2000);
+		regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, 0x9f);
+	}
+
+	fsa->cur_enable = 0x9f;
+
+	return 0;
+}
+
 static int fsa4480_set(struct fsa4480 *fsa)
 {
 	bool reverse = (fsa->orientation == TYPEC_ORIENTATION_REVERSE);
@@ -96,9 +154,10 @@ static int fsa4480_set(struct fsa4480 *fsa)
 		/* DP Only */
 		case TYPEC_DP_STATE_C:
 		case TYPEC_DP_STATE_E:
-			enable |= FSA4480_ENABLE_SBU;
+			enable |= FSA4480_ENABLE_USB | FSA4480_ENABLE_SBU;
+			sel = FSA4480_SEL_USB;
 			if (reverse)
-				sel = FSA4480_SEL_SBU_REVERSE;
+				sel |= FSA4480_SEL_SBU_REVERSE;
 			break;
 
 		/* DP + USB */
@@ -113,11 +172,14 @@ static int fsa4480_set(struct fsa4480 *fsa)
 		default:
 			return -EOPNOTSUPP;
 		}
-	} else if (fsa->mode == TYPEC_MODE_AUDIO) {
-		/* Audio Accessory Mode, setup to auto Jack Detection */
-		enable |= FSA4480_ENABLE_USB | FSA4480_ENABLE_AGND;
-	} else
-		return -EOPNOTSUPP;
+		} else if (fsa->mode == TYPEC_MODE_AUDIO) {
+			return fsa4480_set_android_audio(fsa);
+		} else
+			return -EOPNOTSUPP;
+
+	dev_dbg(&fsa->client->dev,
+		"set orientation=%d mode=0x%lx svid=0x%x enable=0x%02x sel=0x%02x\n",
+		fsa->orientation, fsa->mode, fsa->svid, enable, sel);
 
 	if (fsa->cur_enable & FSA4480_ENABLE_SBU) {
 		/* Disable SBU output while re-configuring the switch */
@@ -127,6 +189,9 @@ static int fsa4480_set(struct fsa4480 *fsa)
 		/* 35us to allow the SBU switch to turn off */
 		usleep_range(35, 1000);
 	}
+
+	if (fsa->cur_enable & FSA4480_ENABLE_AGND)
+		regmap_write(fsa->regmap, FSA4480_RESET, 0x01);
 
 	regmap_write(fsa->regmap, FSA4480_SWITCH_SELECT, sel);
 	regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, enable);

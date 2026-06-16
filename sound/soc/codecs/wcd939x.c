@@ -671,6 +671,7 @@ static int wcd939x_codec_enable_hphr_pa(struct snd_soc_dapm_widget *w,
 					      WCD939X_VNEG_CTRL_4_ILIM_SEL, 0xd);
 		snd_soc_component_write_field(component, WCD939X_ANA_HPH,
 					      WCD939X_HPH_HPHR_REF_ENABLE, true);
+		wcd_clsh_set_hph_mode(wcd939x->clsh_info, hph_mode);
 
 		if (snd_soc_component_read_field(component, WCD939X_ANA_HPH,
 						 WCD939X_HPH_HPHL_REF_ENABLE))
@@ -794,6 +795,7 @@ static int wcd939x_codec_enable_hphl_pa(struct snd_soc_dapm_widget *w,
 					      WCD939X_VNEG_CTRL_4_ILIM_SEL, 0xd);
 		snd_soc_component_write_field(component, WCD939X_ANA_HPH,
 					      WCD939X_HPH_HPHL_REF_ENABLE, true);
+		wcd_clsh_set_hph_mode(wcd939x->clsh_info, hph_mode);
 
 		if (snd_soc_component_read_field(component, WCD939X_ANA_HPH,
 						 WCD939X_HPH_HPHR_REF_ENABLE))
@@ -2974,10 +2976,10 @@ static int wcd939x_soc_codec_probe(struct snd_soc_component *component)
 	int ret, i;
 
 	time_left = wait_for_completion_timeout(&tx_sdw_dev->initialization_complete,
-						msecs_to_jiffies(2000));
+						msecs_to_jiffies(10000));
 	if (!time_left) {
-		dev_err(dev, "soundwire device init timeout\n");
-		return -ETIMEDOUT;
+		dev_err(dev, "soundwire device init timeout, deferring probe\n");
+		return -EPROBE_DEFER;
 	}
 
 	snd_soc_component_init_regmap(component, wcd939x->regmap);
@@ -3105,8 +3107,20 @@ static int wcd939x_codec_set_jack(struct snd_soc_component *comp,
 {
 	struct wcd939x_priv *wcd = dev_get_drvdata(comp->dev);
 
-	if (jack)
-		return wcd_mbhc_start(wcd->wcd_mbhc, &wcd->mbhc_cfg, jack);
+	if (jack) {
+		int ret;
+
+		ret = wcd_mbhc_start(wcd->wcd_mbhc, &wcd->mbhc_cfg, jack);
+		if (ret)
+			return ret;
+
+#if IS_ENABLED(CONFIG_TYPEC)
+		if (wcd->typec_analog_mux && wcd->typec_mode == TYPEC_MODE_AUDIO)
+			return wcd_mbhc_typec_report_plug(wcd->wcd_mbhc);
+#endif /* CONFIG_TYPEC */
+
+		return 0;
+	}
 
 	wcd_mbhc_stop(wcd->wcd_mbhc);
 
@@ -3145,17 +3159,15 @@ static int wcd939x_typec_mux_set(struct typec_mux_dev *mux,
 	struct wcd939x_priv *wcd939x = typec_mux_get_drvdata(mux);
 	unsigned int previous_mode = wcd939x->typec_mode;
 
+	wcd939x->typec_mode = state->mode;
+
 	if (!wcd939x->wcd_mbhc)
-		return -EINVAL;
+		return 0;
 
-	if (wcd939x->typec_mode != state->mode) {
-		wcd939x->typec_mode = state->mode;
-
-		if (wcd939x->typec_mode == TYPEC_MODE_AUDIO)
-			return wcd_mbhc_typec_report_plug(wcd939x->wcd_mbhc);
-		else if (previous_mode == TYPEC_MODE_AUDIO)
-			return wcd_mbhc_typec_report_unplug(wcd939x->wcd_mbhc);
-	}
+	if (wcd939x->typec_mode == TYPEC_MODE_AUDIO)
+		return wcd_mbhc_typec_report_plug(wcd939x->wcd_mbhc);
+	else if (previous_mode == TYPEC_MODE_AUDIO)
+		return wcd_mbhc_typec_report_unplug(wcd939x->wcd_mbhc);
 
 	return 0;
 }

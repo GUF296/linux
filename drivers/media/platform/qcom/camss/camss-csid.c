@@ -388,6 +388,13 @@ static const struct csid_format_info formats_gen2[] = {
 		1,
 	},
 	{
+		MEDIA_BUS_FMT_SBGGR10_2X8_PADHI_LE,
+		MIPI_CSI2_DT_RAW10,
+		DECODE_FORMAT_UNCOMPRESSED_10_BIT,
+		10,
+		1,
+	},
+	{
 		MEDIA_BUS_FMT_SGBRG10_1X10,
 		MIPI_CSI2_DT_RAW10,
 		DECODE_FORMAT_UNCOMPRESSED_10_BIT,

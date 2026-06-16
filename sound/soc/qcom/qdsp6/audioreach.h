@@ -20,12 +20,19 @@ struct q6apm_graph;
 #define MODULE_ID_PLACEHOLDER_DECODER	0x07001009
 #define MODULE_ID_I2S_SINK		0x0700100A
 #define MODULE_ID_I2S_SOURCE		0x0700100B
+#define MODULE_ID_TDM_SINK		0x0700100E
+#define MODULE_ID_TDM_SOURCE		0x0700100F
 #define MODULE_ID_SAL			0x07001010
 #define MODULE_ID_MFC			0x07001015
 #define MODULE_ID_DATA_LOGGING		0x0700101A
 #define MODULE_ID_AAC_DEC		0x0700101F
 #define MODULE_ID_CODEC_DMA_SINK	0x07001023
 #define MODULE_ID_CODEC_DMA_SOURCE	0x07001024
+#define MODULE_ID_Y700_PRE_TDM		0x07001032
+#define MODULE_ID_SPR			MODULE_ID_Y700_PRE_TDM
+#define MODULE_ID_SPLITTER		0x07001011
+#define MODULE_ID_AW_RX			0x10013D01
+#define MODULE_ID_AW_COPP		0x10013D02
 #define MODULE_ID_FLAC_DEC		0x0700102F
 #define MODULE_ID_SMECNS_V2		0x07001031
 #define MODULE_ID_MP3_DECODE		0x0700103B
@@ -490,10 +497,59 @@ struct param_id_i2s_intf_cfg {
 #define I2S_SD1				2
 #define I2S_SD2				3
 #define I2S_SD3				4
+#define I2S_QUAD01			5
+#define I2S_QUAD23			6
+#define I2S_6CHS			7
+#define I2S_8CHS			8
 
 #define PORT_ID_I2S_INPUT		2
 #define PORT_ID_I2S_OUPUT		1
 #define I2S_STACK_SIZE			2048
+
+#define PARAM_ID_TDM_INTF_CFG			0x0800101B
+#define PARAM_ID_TDM_LANE_CFG			0x0800106A
+
+#define TDM_LPAIF_TYPE_LPAIF			0
+#define TDM_LPAIF_TYPE_RXTX			1
+#define TDM_LPAIF_TYPE_WSA			2
+
+#define TDM_INTF_TYPE_PRIMARY			0
+#define TDM_INTF_TYPE_SECONDARY			1
+#define TDM_INTF_TYPE_TERTIARY			2
+#define TDM_INTF_TYPE_QUATERNARY		3
+#define TDM_INTF_TYPE_QUINARY			4
+
+#define TDM_SYNC_SRC_EXTERNAL			0
+#define TDM_SYNC_SRC_INTERNAL			1
+#define TDM_CTRL_DATA_OE_DISABLE		0
+#define TDM_CTRL_DATA_OE_ENABLE			1
+#define TDM_SHORT_SYNC_BIT_MODE			0
+#define TDM_LONG_SYNC_MODE			1
+#define TDM_SHORT_SYNC_SLOT_MODE		2
+#define TDM_SYNC_NORMAL				0
+#define TDM_SYNC_INVERT				1
+#define TDM_DATA_DELAY_0_BCLK_CYCLE		0
+#define TDM_DATA_DELAY_1_BCLK_CYCLE		1
+#define TDM_DATA_DELAY_2_BCLK_CYCLE		2
+
+struct param_id_tdm_intf_cfg {
+	uint32_t lpaif_type;
+	uint32_t intf_idx;
+	uint16_t sync_src;
+	uint16_t ctrl_data_out_enable;
+	uint32_t slot_mask;
+	uint16_t nslots_per_frame;
+	uint16_t slot_width;
+	uint16_t sync_mode;
+	uint16_t ctrl_invert_sync_pulse;
+	uint16_t ctrl_sync_data_delay;
+	uint16_t reserved;
+} __packed;
+
+struct param_id_tdm_lane_cfg {
+	uint16_t lane_mask;
+	uint16_t reserved;
+} __packed;
 
 #define PARAM_ID_DISPLAY_PORT_INTF_CFG		0x08001154
 
@@ -513,9 +569,22 @@ struct param_id_hw_ep_mf {
 } __packed;
 
 #define PARAM_ID_HW_EP_FRAME_SIZE_FACTOR	0x08001018
+#define PARAM_ID_HW_INTF_CLK_CFG		0x0800113C
+#define PARAM_ID_SPR_DELAY_PATH_END		0x080010C4
 
 struct param_id_fram_size_factor {
 	uint32_t frame_size_factor;
+} __packed;
+
+#define CLOCK_ID_PRI_TDM_IBIT			0x200
+#define CLOCK_ATTRIBUTE_COUPLE_NO		0x1
+#define CLOCK_ROOT_DEFAULT			0x0
+
+struct param_id_hw_intf_clk_cfg {
+	uint32_t clock_id;
+	uint32_t clock_freq;
+	uint32_t clock_attri;
+	uint32_t clock_root;
 } __packed;
 
 #define APM_CONTAINER_PROP_ID_PARENT_CONTAINER_ID	0x080010CB
@@ -809,6 +878,7 @@ struct audioreach_module_config {
 	u32	sample_rate;
 	u16	bit_width;
 	u16	bits_per_sample;
+	u16	frame_size_factor;
 
 	u16	data_format;
 	u16	num_channels;

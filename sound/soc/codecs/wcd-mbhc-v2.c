@@ -362,7 +362,8 @@ static void wcd_mbhc_report_plug_insertion(struct wcd_mbhc *mbhc,
 
 	if (!is_pa_on) {
 		wcd_mbhc_compute_impedance(mbhc);
-		if ((mbhc->zl > mbhc->cfg->linein_th) &&
+		if (!mbhc->cfg->typec_analog_mux &&
+		    (mbhc->zl > mbhc->cfg->linein_th) &&
 		    (mbhc->zr > mbhc->cfg->linein_th) &&
 		    (jack_type == SND_JACK_HEADPHONE)) {
 			jack_type = SND_JACK_LINEOUT;
@@ -524,7 +525,6 @@ static void mbhc_plug_detect_fn(struct work_struct *work)
 	wcd_mbhc_cancel_pending_work(mbhc);
 
 	detection_type = wcd_mbhc_read_field(mbhc, WCD_MBHC_MECH_DETECTION_TYPE);
-
 	/* Set the detection type appropriately */
 	wcd_mbhc_write_field(mbhc, WCD_MBHC_MECH_DETECTION_TYPE, !detection_type);
 
@@ -617,6 +617,7 @@ int wcd_mbhc_typec_report_plug(struct wcd_mbhc *mbhc)
 	if (mbhc->mbhc_cb->clk_setup)
 		mbhc->mbhc_cb->clk_setup(mbhc->component, true);
 	wcd_mbhc_write_field(mbhc, WCD_MBHC_L_DET_EN, 1);
+	wcd_mbhc_write_field(mbhc, WCD_MBHC_MECH_DETECTION_TYPE, 1);
 
 	schedule_work(&mbhc->mbhc_plug_detect_work);
 
@@ -774,6 +775,15 @@ static int wcd_mbhc_initialise(struct wcd_mbhc *mbhc)
 		mbhc->swap_thr = GND_MIC_USBC_SWAP_THRESHOLD;
 	else
 		mbhc->swap_thr = GND_MIC_SWAP_THRESHOLD;
+
+	if (mbhc->cfg->typec_analog_mux) {
+		/*
+		 * Lenovo's downstream runtime DT uses active-low MBHC switch
+		 * polarity for the Type-C analog path.
+		 */
+		mbhc->cfg->hphl_swh = false;
+		mbhc->cfg->gnd_swh = false;
+	}
 
 	/* setup HS detection */
 	if (mbhc->mbhc_cb->hph_pull_up_control_v2)
@@ -1189,7 +1199,6 @@ static void wcd_correct_swch_plug(struct work_struct *work)
 	/* Find plug type */
 	output_mv = wcd_measure_adc_continuous(mbhc);
 	plug_type = wcd_mbhc_get_plug_from_adc(mbhc, output_mv);
-
 	/*
 	 * Report plug type if it is either headset or headphone
 	 * else start the 3 sec loop
