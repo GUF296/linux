@@ -208,7 +208,7 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
-	struct audioreach_module_config cfg = {};
+	struct audioreach_module_config cfg;
 	struct device *dev = component->dev;
 	struct q6apm_dai_data *pdata;
 	int ret;
@@ -223,16 +223,11 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	}
 
 	cfg.direction = substream->stream;
-	cfg.sample_rate = runtime->rate ?: 48000;
-	cfg.num_channels = runtime->channels ?: 2;
-	cfg.bit_width = prtd->bits_per_sample ?: 16;
+	cfg.sample_rate = runtime->rate;
+	cfg.num_channels = runtime->channels;
+	cfg.bit_width = prtd->bits_per_sample;
 	cfg.fmt = SND_AUDIOCODEC_PCM;
-	audioreach_set_default_channel_mapping(cfg.channel_map, cfg.num_channels);
-	dev_info(dev,
-		 "Y700 FE prepare: graph=%u dir=%d rate=%u channels=%u bw=%u runtime rate=%u channels=%u bps=%u\n",
-		 prtd->graph->id, cfg.direction, cfg.sample_rate,
-		 cfg.num_channels, cfg.bit_width, runtime->rate,
-		 runtime->channels, prtd->bits_per_sample);
+	audioreach_set_default_channel_mapping(cfg.channel_map, runtime->channels);
 	if (prtd->state) {
 		/* clear the previous setup if any  */
 		q6apm_graph_stop(prtd->graph);

@@ -36,18 +36,7 @@ struct q6apm_lpass_dai_data {
 static struct clk *q6apm_lpass_y700_sec_ibit_clk(struct q6apm_lpass_dai_data *dai_data,
 						 int dai_id)
 {
-	if (dai_id == SECONDARY_MI2S_RX)
-		return dai_data->sec_mi2s_ibit_clk;
-
-	return dai_data->sec_tdm_ibit_clk;
-}
-
-static const char *q6apm_lpass_y700_sec_clk_name(int dai_id)
-{
-	if (dai_id == SECONDARY_MI2S_RX)
-		return "SEC MI2S";
-
-	return "SEC TDM";
+	return dai_data->sec_mi2s_ibit_clk;
 }
 
 static int q6dma_set_channel_map(struct snd_soc_dai *dai,
@@ -166,16 +155,10 @@ static int q6tdm_set_tdm_slot(struct snd_soc_dai *dai,
 		rx_mask &= cap_mask;
 
 	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX)
-		cfg->frame_size_factor = 1;
+		cfg->frame_size_factor = slots;
 	else
 		cfg->frame_size_factor = slots;
 	cfg->sd_line_mask = (dai->id & 0x1) ? tx_mask : rx_mask;
-
-	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX)
-		dev_info(dai->dev,
-			 "Y700 TDM slot: dai=%d tx=0x%x rx=0x%x slots=%d slot_width=%d frame_size_factor=%u sd_line_mask=0x%x\n",
-			 dai->id, tx_mask, rx_mask, slots, slot_width,
-			 cfg->frame_size_factor, cfg->sd_line_mask);
 
 	return 0;
 }
@@ -218,11 +201,6 @@ static int q6i2s_set_tdm_slot(struct snd_soc_dai *dai,
 
 	cfg->frame_size_factor = 1;
 	cfg->sd_line_mask = rx_mask & cap_mask;
-
-	dev_info(dai->dev,
-		 "Y700 I2S slot: dai=%d tx=0x%x rx=0x%x slots=%d slot_width=%d frame_size_factor=%u sd_line_mask=0x%x\n",
-		 dai->id, tx_mask, rx_mask, slots, slot_width,
-		 cfg->frame_size_factor, cfg->sd_line_mask);
 
 	return 0;
 }
@@ -270,17 +248,6 @@ static int q6tdm_set_channel_map(struct snd_soc_dai *dai,
 	audioreach_set_default_channel_mapping(cfg->channel_map, num);
 
 	cfg->num_channels = num;
-	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX)
-		dev_info(dai->dev,
-			 "Y700 TDM chmap: dai=%d num=%u pcm-map=%u,%u,%u,%u,%u,%u,%u,%u slot=%u,%u,%u,%u,%u,%u,%u,%u\n",
-			 dai->id, cfg->num_channels,
-			 cfg->channel_map[0], cfg->channel_map[1],
-			 cfg->channel_map[2], cfg->channel_map[3],
-			 cfg->channel_map[4], cfg->channel_map[5],
-			 cfg->channel_map[6], cfg->channel_map[7],
-			 slot[0], slot[1], slot[2], slot[3],
-			 slot[4], slot[5], slot[6], slot[7]);
-
 	return 0;
 }
 
@@ -304,18 +271,6 @@ static int q6i2s_set_channel_map(struct snd_soc_dai *dai,
 
 	audioreach_set_default_channel_mapping(cfg->channel_map, rx_num);
 	cfg->num_channels = rx_num;
-
-	dev_info(dai->dev,
-		 "Y700 I2S chmap: dai=%d num=%u pcm-map=%u,%u,%u,%u,%u,%u,%u,%u slot=%u,%u,%u,%u,%u,%u,%u,%u\n",
-		 dai->id, cfg->num_channels,
-		 cfg->channel_map[0], cfg->channel_map[1],
-		 cfg->channel_map[2], cfg->channel_map[3],
-		 cfg->channel_map[4], cfg->channel_map[5],
-		 cfg->channel_map[6], cfg->channel_map[7],
-		 rx_slot ? rx_slot[0] : 0, rx_slot ? rx_slot[1] : 0,
-		 rx_slot ? rx_slot[2] : 0, rx_slot ? rx_slot[3] : 0,
-		 rx_slot ? rx_slot[4] : 0, rx_slot ? rx_slot[5] : 0,
-		 rx_slot ? rx_slot[6] : 0, rx_slot ? rx_slot[7] : 0);
 
 	for (i = rx_num; i < AR_PCM_MAX_NUM_CHANNEL; i++)
 		cfg->channel_map[i] = 0;
@@ -366,6 +321,15 @@ static int q6dma_hw_params(struct snd_pcm_substream *substream,
 	cfg->num_channels = channels;
 	audioreach_set_default_channel_mapping(cfg->channel_map, channels);
 
+	if (dai->id == SECONDARY_MI2S_RX) {
+		cfg->bit_width = 32;
+		cfg->num_channels = 8;
+		cfg->sd_line_mask = 0x3;
+		cfg->frame_size_factor = 1;
+		audioreach_set_default_channel_mapping(cfg->channel_map,
+						       cfg->num_channels);
+	}
+
 	return 0;
 }
 
@@ -381,13 +345,19 @@ static int q6tdm_hw_params(struct snd_pcm_substream *substream,
 	cfg->sample_rate = params_rate(params);
 	cfg->num_channels = channels;
 
-	if (dai->id == SECONDARY_TDM_RX_0)
-		dev_info(dai->dev,
-			 "Y700 TDM hw_params: dai=%d rate=%u channels=%u params_fmt=%d width=%u cfg_bw=%u fsf=%u sd_mask=0x%x\n",
-			 dai->id, cfg->sample_rate, cfg->num_channels,
-			 params_format(params), params_width(params),
-			 cfg->bit_width, cfg->frame_size_factor,
-			 cfg->sd_line_mask);
+	if (dai->id == SECONDARY_TDM_RX_0) {
+		/*
+		 * Y700 uses a stereo S24 stream on secondary TDM. Android's
+		 * group slot_mask=3 describes slot0/slot1, not two physical SD
+		 * lines. Keep the data line as SD0 here; the TDM endpoint payload
+		 * maps this to slot_mask=3 for the AW2308 pair.
+		 */
+		cfg->bit_width = 24;
+		cfg->num_channels = 2;
+		cfg->sd_line_mask = 0x1;
+		cfg->frame_size_factor = 8;
+		audioreach_set_default_channel_mapping(cfg->channel_map, cfg->num_channels);
+	}
 
 	return 0;
 }
@@ -411,27 +381,24 @@ static void q6apm_lpass_dai_shutdown(struct snd_pcm_substream *substream, struct
 
 	if ((dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX) &&
 	    dai_data->sec_tdm_clks_enabled) {
-		struct clk *ibit_clk = q6apm_lpass_y700_sec_ibit_clk(dai_data, dai->id);
-
-		if (ibit_clk)
-			clk_disable_unprepare(ibit_clk);
+		if (q6apm_lpass_y700_sec_ibit_clk(dai_data, dai->id))
+			clk_disable_unprepare(q6apm_lpass_y700_sec_ibit_clk(dai_data,
+									     dai->id));
 		dai_data->sec_tdm_clks_enabled = false;
-		dev_info(dai->dev, "Y700 %s ibit clock disabled\n",
-			 q6apm_lpass_y700_sec_clk_name(dai->id));
 	}
 }
 
 static int q6apm_lpass_enable_sec_tdm_clks(struct snd_soc_dai *dai)
 {
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
-	struct clk *ibit_clk = q6apm_lpass_y700_sec_ibit_clk(dai_data, dai->id);
 	int ret;
 
 	if (dai_data->sec_tdm_clks_enabled)
 		return 0;
 
-	if (dai_data->sec_tdm_ibit_clk) {
-		ret = clk_set_rate(dai_data->sec_tdm_ibit_clk,
+	if (q6apm_lpass_y700_sec_ibit_clk(dai_data, dai->id)) {
+		ret = clk_set_rate(q6apm_lpass_y700_sec_ibit_clk(dai_data,
+								 dai->id),
 				   Y700_SEC_TDM_BCLK_RATE);
 		if (ret)
 			dev_warn(dai->dev,
@@ -439,42 +406,13 @@ static int q6apm_lpass_enable_sec_tdm_clks(struct snd_soc_dai *dai)
 				 ret);
 	}
 
-	if (dai_data->sec_tdm_ebit_clk) {
-		ret = clk_set_rate(dai_data->sec_tdm_ebit_clk,
-				   Y700_SEC_TDM_BCLK_RATE);
-		if (ret)
-			dev_warn(dai->dev,
-				 "Y700 TDM ebit clk_set_rate failed: %d\n",
-				 ret);
-	}
-
-	if (dai_data->sec_mi2s_ibit_clk) {
-		ret = clk_set_rate(dai_data->sec_mi2s_ibit_clk,
-				   Y700_SEC_TDM_BCLK_RATE);
-		if (ret)
-			dev_warn(dai->dev,
-				 "Y700 SEC MI2S ibit clk_set_rate failed: %d\n",
-				 ret);
-	}
-
-	if (dai_data->sec_mi2s_ebit_clk) {
-		ret = clk_set_rate(dai_data->sec_mi2s_ebit_clk,
-				   Y700_SEC_TDM_BCLK_RATE);
-		if (ret)
-			dev_warn(dai->dev,
-				 "Y700 SEC MI2S ebit clk_set_rate failed: %d\n",
-				 ret);
-	}
-
-	ret = ibit_clk ? clk_prepare_enable(ibit_clk) : 0;
+	ret = q6apm_lpass_y700_sec_ibit_clk(dai_data, dai->id) ?
+		clk_prepare_enable(q6apm_lpass_y700_sec_ibit_clk(dai_data,
+								 dai->id)) : 0;
 	if (ret)
 		return ret;
 
 	dai_data->sec_tdm_clks_enabled = true;
-	dev_info(dai->dev, "Y700 %s ibit clock enabled: %u Hz\n",
-		 q6apm_lpass_y700_sec_clk_name(dai->id),
-		 Y700_SEC_TDM_BCLK_RATE);
-
 	return 0;
 }
 
@@ -539,13 +477,6 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 	}
 
 	cfg->direction = substream->stream;
-	if (dai->id == SECONDARY_TDM_RX_0 || dai->id == SECONDARY_MI2S_RX)
-		dev_info(dai->dev,
-			 "Y700 TDM prepare: dai=%d graph=%d dir=%d rate=%u channels=%u bw=%u fmt=0x%x fsf=%u sd_mask=0x%x\n",
-			 dai->id, graph_id, cfg->direction, cfg->sample_rate,
-			 cfg->num_channels, cfg->bit_width, cfg->fmt,
-			 cfg->frame_size_factor, cfg->sd_line_mask);
-
 	rc = q6apm_graph_media_format_pcm(dai_data->graph[dai->id], cfg);
 	if (rc) {
 		dev_err(dai->dev, "Failed to set media format %d\n", rc);
