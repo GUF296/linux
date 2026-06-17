@@ -18,6 +18,12 @@
 
 /delete-node/ &rmtfs_mem;
 /delete-node/ &hwfence_shbuf;
+/delete-node/ &remoteproc_mpss;
+/delete-node/ &qlink_logging_mem;
+/delete-node/ &mpss_dsm_mem;
+/delete-node/ &mpss_dsm_mem_2;
+/delete-node/ &mpss_mem;
+/delete-node/ &q6_mpss_dtb_mem;
 
 / {
 	model = "Lenovo Legion Y700 (2025) / TB321FU";
@@ -765,23 +771,6 @@
 	};
 };
 
-&i2c3 {
-       status = "okay";
-
-
-       wcd_usbss: typec-mux@e {
-			compatible = "qcom,wcd9395-usbss", "qcom,wcd9390-usbss";
-			reg = <0xe>;
-			status = "disabled";
-
-				vdd-supply = <&vreg_l15b_1p8>;
-
-			qcom,virtual-usbss;
-			mode-switch;
-			orientation-switch;
-	       };
-};
-
 &i2c6 {
 	status = "okay";
 
@@ -867,13 +856,6 @@
 			};
 		};
 	};
-};
-
-&ipa {
-	qcom,gsi-loader = "self";
-	memory-region = <&ipa_fw_mem>;
-	firmware-name = "qcom/sm8650/lenovo/tb321fu/ipa_fws.mdt";
-	status = "okay";
 };
 
 &i2c10 {
@@ -1139,33 +1121,6 @@
 	};
 };
 
-&pm8550_pwm {
-	status = "okay";
-
-	multi-led {
-		color = <LED_COLOR_ID_RGB>;
-		function = LED_FUNCTION_STATUS;
-
-		#address-cells = <1>;
-		#size-cells = <0>;
-
-		led@1 {
-			reg = <1>;
-			color = <LED_COLOR_ID_RED>;
-		};
-
-		led@2 {
-			reg = <2>;
-			color = <LED_COLOR_ID_GREEN>;
-		};
-
-		led@3 {
-			reg = <3>;
-			color = <LED_COLOR_ID_BLUE>;
-		};
-	};
-};
-
 &pm8550b_eusb2_repeater {
 	vdd18-supply = <&vreg_l15b_1p8>;
 	vdd3-supply = <&vreg_l5b_3p1>;
@@ -1216,11 +1171,6 @@
 			"qcom/sm8650/lenovo/tb321fu/cdsp_dtb.mdt";
 
 	status = "okay";
-};
-
-&remoteproc_mpss {
-	/* TB321FU is a Wi-Fi-only tablet; no MPSS firmware is present. */
-	status = "disabled";
 };
 
 &reserved_memory {
@@ -1891,11 +1841,4 @@
 		};
 	};
 };
-&ipa { status = "disabled"; };
-
-/* The PMIC flash LED controller is wired to the rear camera flash. */
-&pm8550_flash { status = "okay"; };
-&pm8550_pwm { status = "disabled"; };
-&remoteproc_mpss { status = "disabled"; };
-&spi4 { status = "okay"; };
 /* Keep UART14 enabled for WCN7850 Bluetooth bring-up. */
