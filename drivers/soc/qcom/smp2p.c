@@ -194,10 +194,12 @@ static bool qcom_smp2p_check_ssr(struct qcom_smp2p *smp2p)
 
 	restart_done = in->flags & BIT(SMP2P_FLAGS_RESTART_DONE_BIT);
 	restart = restart_done != smp2p->ssr_ack;
-	list_for_each_entry(entry, &smp2p->inbound, node) {
-		if (!entry->value)
-			continue;
-		entry->last_value = 0;
+	if (restart) {
+		list_for_each_entry(entry, &smp2p->inbound, node) {
+			if (!entry->value)
+				continue;
+			entry->last_value = 0;
+		}
 	}
 
 	return restart;
