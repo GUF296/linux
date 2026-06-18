@@ -19,6 +19,11 @@
 /delete-node/ &rmtfs_mem;
 /delete-node/ &hwfence_shbuf;
 /delete-node/ &remoteproc_mpss;
+/delete-node/ &qlink_logging_mem;
+/delete-node/ &mpss_dsm_mem;
+/delete-node/ &mpss_dsm_mem_2;
+/delete-node/ &mpss_mem;
+/delete-node/ &q6_mpss_dtb_mem;
 
 / {
 	model = "Lenovo Legion Y700 (2025) / TB321FU";
@@ -1182,6 +1187,7 @@
 	splash_region: splash-region {
 		label = "cont_splash_region";
 		reg = <0 0xd5100000 0 0x2b00000>;
+		no-map;
 	};
 };
 
