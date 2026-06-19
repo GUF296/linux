@@ -23,6 +23,7 @@ enum qcom_battmgr_variant {
 	QCOM_BATTMGR_SC8280XP,
 	QCOM_BATTMGR_SM8350,
 	QCOM_BATTMGR_SM8550,
+	QCOM_BATTMGR_SM8650,
 	QCOM_BATTMGR_X1E80100,
 };
 
@@ -1432,7 +1433,10 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->info.voltage_max = le32_to_cpu(resp->intval.value);
 			break;
 		case BATT_CURR_NOW:
-			battmgr->status.current_now = le32_to_cpu(resp->intval.value);
+			if (battmgr->variant == QCOM_BATTMGR_SM8650)
+				battmgr->status.current_now = -le32_to_cpu(resp->intval.value);
+			else
+				battmgr->status.current_now = le32_to_cpu(resp->intval.value);
 			break;
 		case BATT_TEMP:
 			val = le32_to_cpu(resp->intval.value);
@@ -1615,6 +1619,7 @@ static const struct of_device_id qcom_battmgr_of_variants[] = {
 	{ .compatible = "qcom,kaanapali-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8550 },
 	{ .compatible = "qcom,sc8180x-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
 	{ .compatible = "qcom,sc8280xp-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
+	{ .compatible = "qcom,sm8650-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8650 },
 	{ .compatible = "qcom,sm8550-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8550 },
 	{ .compatible = "qcom,x1e80100-pmic-glink", .data = (void *)QCOM_BATTMGR_X1E80100 },
 	/* Unmatched devices falls back to QCOM_BATTMGR_SM8350 */
@@ -1690,7 +1695,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
 					     "failed to register wireless charing power supply\n");
 	} else {
-		if (battmgr->variant == QCOM_BATTMGR_SM8550)
+		if (battmgr->variant == QCOM_BATTMGR_SM8550 ||
+		    battmgr->variant == QCOM_BATTMGR_SM8650)
 			psy_desc = &sm8550_bat_psy_desc;
 		else
 			psy_desc = &sm8350_bat_psy_desc;
