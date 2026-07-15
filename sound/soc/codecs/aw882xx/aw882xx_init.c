@@ -42,7 +42,7 @@
 #include "aw882xx_pid_2308_reg.h"
 #include "aw882xx_log.h"
 
-int aw882xx_dev_i2c_write_bits(struct aw_device *aw_dev,
+static int aw882xx_dev_i2c_write_bits(struct aw_device *aw_dev,
 	unsigned char reg_addr, unsigned int mask, unsigned int reg_data)
 {
 	struct aw882xx *aw882xx = (struct aw882xx *)aw_dev->private_data;
@@ -50,7 +50,7 @@ int aw882xx_dev_i2c_write_bits(struct aw_device *aw_dev,
 	return aw882xx_i2c_write_bits(aw882xx, reg_addr, mask, reg_data);
 }
 
-int aw882xx_dev_i2c_write(struct aw_device *aw_dev,
+static int aw882xx_dev_i2c_write(struct aw_device *aw_dev,
 	unsigned char reg_addr, unsigned int reg_data)
 {
 	struct aw882xx *aw882xx = (struct aw882xx *)aw_dev->private_data;
@@ -58,7 +58,7 @@ int aw882xx_dev_i2c_write(struct aw_device *aw_dev,
 	return aw882xx_i2c_write(aw882xx, reg_addr, reg_data);
 }
 
-int aw882xx_dev_i2c_read(struct aw_device *aw_dev,
+static int aw882xx_dev_i2c_read(struct aw_device *aw_dev,
 	unsigned char reg_addr, unsigned int *reg_data)
 {
 	struct aw882xx *aw882xx = (struct aw882xx *)aw_dev->private_data;
@@ -66,7 +66,7 @@ int aw882xx_dev_i2c_read(struct aw_device *aw_dev,
 	return aw882xx_i2c_read(aw882xx, reg_addr, reg_data);
 }
 
-void aw882xx_dev_set_algo_en(struct aw_device *aw_dev)
+static void aw882xx_dev_set_algo_en(struct aw_device *aw_dev)
 {
 	struct aw882xx *aw882xx = (struct aw882xx *)aw_dev->private_data;
 

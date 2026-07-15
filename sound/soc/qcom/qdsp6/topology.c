@@ -47,6 +47,7 @@ static struct audioreach_graph_info *audioreach_tplg_alloc_graph_info(struct q6a
 		return ERR_PTR(-ENOMEM);
 
 	INIT_LIST_HEAD(&info->sg_list);
+	mutex_init(&info->mem_map_lock);
 
 	mutex_lock(&apm->lock);
 	ret = idr_alloc_u32(&apm->graph_info_idr, info, &graph_id, graph_id, GFP_KERNEL);
@@ -957,17 +958,26 @@ static int audioreach_widget_unload(struct snd_soc_component *scomp,
 	struct audioreach_container *cont;
 	struct audioreach_module *mod;
 
+	down_write(&apm->graph_lock);
+	if (apm->topology_deferred)
+		goto unlock_graph;
+
+	if (atomic_read(&apm->active_graphs)) {
+		apm->topology_deferred = true;
+		goto unlock_graph;
+	}
+
 	if (w->id == snd_soc_dapm_mixer) {
 		/* virtual widget */
 		struct snd_ar_control *scontrol = dobj->private;
 
 		list_del(&scontrol->node);
 		kfree(scontrol);
-		return 0;
+		goto unlock_graph;
 	}
 	mod = dobj->private;
 	if (!mod)
-		return 0;
+		goto unlock_graph;
 
 	cont = mod->container;
 
@@ -1003,8 +1013,56 @@ static int audioreach_widget_unload(struct snd_soc_component *scomp,
 	}
 
 	mutex_unlock(&apm->lock);
+unlock_graph:
+	up_write(&apm->graph_lock);
 
 	return 0;
+}
+
+void audioreach_tplg_free_deferred(struct q6apm *apm)
+{
+	struct audioreach_graph_info *info;
+	struct audioreach_sub_graph *sg, *sg_tmp;
+	struct audioreach_container *cont, *cont_tmp;
+	struct audioreach_module *mod, *mod_tmp;
+	struct snd_ar_control *control, *control_tmp;
+	int id = 0;
+
+	if (!apm->topology_deferred || !apm->topology_remove_complete ||
+	    atomic_read(&apm->active_graphs))
+		return;
+
+	mutex_lock(&apm->lock);
+	while ((info = idr_get_next(&apm->graph_info_idr, &id))) {
+		idr_remove(&apm->graph_info_idr, info->id);
+		list_for_each_entry_safe(sg, sg_tmp, &info->sg_list, node) {
+			list_for_each_entry_safe(cont, cont_tmp,
+						 &sg->container_list, node) {
+				list_for_each_entry_safe(mod, mod_tmp,
+							 &cont->modules_list, node) {
+					idr_remove(&apm->modules_idr,
+						   mod->instance_id);
+					list_del(&mod->node);
+					kfree(mod->data);
+					kfree(mod);
+				}
+				idr_remove(&apm->containers_idr,
+					   cont->container_id);
+				list_del(&cont->node);
+				kfree(cont);
+			}
+			idr_remove(&apm->sub_graphs_idr, sg->sub_graph_id);
+			list_del(&sg->node);
+			kfree(sg);
+		}
+		kfree(info);
+	}
+
+	list_for_each_entry_safe(control, control_tmp, &apm->widget_list, node) {
+		list_del(&control->node);
+		kfree(control);
+	}
+	mutex_unlock(&apm->lock);
 }
 
 static struct snd_ar_control *audioreach_find_widget(struct snd_soc_component *comp,
@@ -1104,16 +1162,26 @@ static int audioreach_link_load(struct snd_soc_component *component, int index,
 	return 0;
 }
 
-static void audioreach_connect_sub_graphs(struct q6apm *apm,
-					  const struct snd_ar_control *m1,
-					  const struct snd_ar_control *m2,
-					  bool connect)
+static int audioreach_connect_sub_graphs(struct q6apm *apm,
+					 const struct snd_ar_control *m1,
+					 const struct snd_ar_control *m2,
+					 bool connect)
 {
 	struct audioreach_graph_info *info;
+	int ret = 0;
 
+	down_read(&apm->graph_lock);
 	mutex_lock(&apm->lock);
 	info = idr_find(&apm->graph_info_idr, m2->graph_id);
-	mutex_unlock(&apm->lock);
+	if (!info) {
+		mutex_unlock(&apm->lock);
+		dev_err(apm->dev,
+			"AudioReach mixer graph %u missing: src=0x%x dst=0x%x connect=%d\n",
+			m2->graph_id, m1->module_instance_id,
+			m2->module_instance_id, connect);
+		ret = -ENODEV;
+		goto unlock_graph;
+	}
 
 	if (connect) {
 		info->src_mod_inst_id = m1->module_instance_id;
@@ -1127,6 +1195,11 @@ static void audioreach_connect_sub_graphs(struct q6apm *apm,
 		info->dst_mod_inst_id = 0;
 		info->dst_mod_ip_port_id = 0;
 	}
+	mutex_unlock(&apm->lock);
+
+unlock_graph:
+	up_read(&apm->graph_lock);
+	return ret;
 }
 
 static bool audioreach_is_vmixer_connected(struct q6apm *apm,
@@ -1134,16 +1207,18 @@ static bool audioreach_is_vmixer_connected(struct q6apm *apm,
 					   const struct snd_ar_control *m2)
 {
 	const struct audioreach_graph_info *info;
+	bool connected = false;
 
+	down_read(&apm->graph_lock);
 	mutex_lock(&apm->lock);
 	info = idr_find(&apm->graph_info_idr, m2->graph_id);
-	mutex_unlock(&apm->lock);
-
-	if (info->dst_mod_inst_id == m2->module_instance_id &&
+	if (info && info->dst_mod_inst_id == m2->module_instance_id &&
 	    info->src_mod_inst_id == m1->module_instance_id)
-		return true;
+		connected = true;
+	mutex_unlock(&apm->lock);
+	up_read(&apm->graph_lock);
 
-	return false;
+	return connected;
 }
 
 static int audioreach_get_audio_mixer(struct snd_kcontrol *kcontrol,
@@ -1177,12 +1252,17 @@ static int audioreach_put_audio_mixer(struct snd_kcontrol *kcontrol,
 	const struct snd_ar_control *dapm_scontrol = dw->dobj.private;
 	const struct snd_ar_control *scontrol = mc->dobj.private;
 	struct q6apm *data = dev_get_drvdata(c->dev);
+	int ret;
 
 	if (ucontrol->value.integer.value[0]) {
-		audioreach_connect_sub_graphs(data, scontrol, dapm_scontrol, true);
+		ret = audioreach_connect_sub_graphs(data, scontrol, dapm_scontrol, true);
+		if (ret)
+			return ret;
 		snd_soc_dapm_mixer_update_power(dapm, kcontrol, 1, NULL);
 	} else {
-		audioreach_connect_sub_graphs(data, scontrol, dapm_scontrol, false);
+		ret = audioreach_connect_sub_graphs(data, scontrol, dapm_scontrol, false);
+		if (ret)
+			return ret;
 		snd_soc_dapm_mixer_update_power(dapm, kcontrol, 0, NULL);
 	}
 	return 0;

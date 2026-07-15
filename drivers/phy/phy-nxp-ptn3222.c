@@ -52,7 +52,8 @@ static int ptn3222_write_param_override(struct ptn3222 *ptn3222)
 static int ptn3222_init(struct phy *phy)
 {
 	struct ptn3222 *ptn3222 = phy_get_drvdata(phy);
-	int ret;
+	struct device *dev = &ptn3222->client->dev;
+	int disable_ret, ret;
 
 	ret = regulator_bulk_enable(NUM_SUPPLIES, ptn3222->supplies);
 	if (ret)
@@ -62,7 +63,17 @@ static int ptn3222_init(struct phy *phy)
 
 	usleep_range(1000, 2000);
 
-	return ptn3222_write_param_override(ptn3222);
+	ret = ptn3222_write_param_override(ptn3222);
+	if (!ret)
+		return 0;
+
+	gpiod_set_value_cansleep(ptn3222->reset_gpio, 1);
+	disable_ret = regulator_bulk_disable(NUM_SUPPLIES, ptn3222->supplies);
+	if (disable_ret)
+		dev_err(dev, "failed to disable supplies after init error: %d\n",
+			disable_ret);
+
+	return ret;
 }
 
 static int ptn3222_exit(struct phy *phy)
@@ -136,8 +147,8 @@ static int ptn3222_probe(struct i2c_client *client)
 
 	ptn3222->phy = devm_phy_create(dev, dev->of_node, &ptn3222_ops);
 	if (IS_ERR(ptn3222->phy)) {
-		dev_err(dev, "failed to create PHY: %d\n", ret);
-		return PTR_ERR(ptn3222->phy);
+		ret = PTR_ERR(ptn3222->phy);
+		return dev_err_probe(dev, ret, "failed to create PHY\n");
 	}
 
 	phy_set_drvdata(ptn3222->phy, ptn3222);

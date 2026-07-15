@@ -60,31 +60,67 @@ static char *profile_name[AW_PROFILE_MAX] = {
 
 static int aw_parse_bin_header_1_0_0(struct aw_bin *bin);
 
+static bool aw_bin_range_valid(const struct aw_bin *bin, unsigned int offset,
+		unsigned int len)
+{
+	return offset <= bin->info.len && len <= bin->info.len - offset;
+}
+
+static int aw_bin_set_cursor(struct aw_bin *bin, unsigned int offset)
+{
+	if (!aw_bin_range_valid(bin, offset, 0))
+		return -EINVAL;
+
+	bin->p_addr = bin->info.data + offset;
+	return 0;
+}
+
+static unsigned int aw_bin_cursor_offset(const struct aw_bin *bin)
+{
+	return bin->p_addr - bin->info.data;
+}
+
 /********************************************************
  *
  * check sum data
  *
  ********************************************************/
-int aw_check_sum(struct aw_bin *bin, int bin_num)
+static int aw_check_sum(struct aw_bin *bin, int bin_num)
 {
 	unsigned int i = 0;
 	unsigned int sum_data = 0;
 	unsigned int check_sum = 0;
+	unsigned int frame_addr;
+	unsigned int frame_len;
 	unsigned char *p_check_sum = NULL;
 
 	DBG("enter\n");
 
-	p_check_sum = &(bin->info.data[(bin->header_info[bin_num].valid_data_addr -
-			      bin->header_info[bin_num].header_len)]);
+	if (bin_num < 0 || bin_num >= bin->all_bin_parse_num)
+		return -EINVAL;
+
+	if (bin->header_info[bin_num].valid_data_addr <
+	    bin->header_info[bin_num].header_len)
+		return -EINVAL;
+
+	frame_addr = bin->header_info[bin_num].valid_data_addr -
+		     bin->header_info[bin_num].header_len;
+	if (bin->header_info[bin_num].bin_data_len >
+	    UINT_MAX - bin->header_info[bin_num].header_len)
+		return -EINVAL;
+	frame_len = bin->header_info[bin_num].header_len +
+		    bin->header_info[bin_num].bin_data_len;
+	if (!aw_bin_range_valid(bin, frame_addr, frame_len))
+		return -EINVAL;
+
+	p_check_sum = &bin->info.data[frame_addr];
 	DBG("aw_bin_parse p_check_sum = %p\n", p_check_sum);
 	check_sum = GET_32_DATA(*(p_check_sum + 3),
 				*(p_check_sum + 2),
 				*(p_check_sum + 1), *(p_check_sum));
 
-	for (i = 4; i < bin->header_info[bin_num].bin_data_len +
-			bin->header_info[bin_num].header_len; i++) {
+	for (i = 4; i < frame_len; i++)
 		sum_data += *(p_check_sum + i);
-	}
 	DBG("aw_bin_parse bin_num=%d, check_sum = 0x%x, sum_data = 0x%x\n",
 		bin_num, check_sum, sum_data);
 	if (sum_data != check_sum) {
@@ -98,7 +134,7 @@ int aw_check_sum(struct aw_bin *bin, int bin_num)
 	return 0;
 }
 
-int aw_check_data_version(struct aw_bin *bin, int bin_num)
+static int aw_check_data_version(struct aw_bin *bin, int bin_num)
 {
 	int i = 0;
 
@@ -113,22 +149,39 @@ int aw_check_data_version(struct aw_bin *bin, int bin_num)
 	return -EINVAL;
 }
 
-int aw_check_register_num_v1(struct aw_bin *bin, int bin_num)
+static int aw_check_register_num_v1(struct aw_bin *bin, int bin_num)
 {
 	unsigned int check_register_num = 0;
 	unsigned int parse_register_num = 0;
+	unsigned int record_len;
 	char *p_check_sum = NULL;
 
 	DBG("enter\n");
+	if (bin_num < 0 || bin_num >= bin->all_bin_parse_num)
+		return -EINVAL;
 
-	p_check_sum = &(bin->info.data[(bin->header_info[bin_num].valid_data_addr)]);
+	if (bin->header_info[bin_num].bin_data_len < 4 ||
+	    !aw_bin_range_valid(bin,
+		bin->header_info[bin_num].valid_data_addr,
+		bin->header_info[bin_num].bin_data_len))
+		return -EINVAL;
+
+	if (bin->header_info[bin_num].reg_byte_len >
+	    UINT_MAX - bin->header_info[bin_num].data_byte_len)
+		return -EINVAL;
+	record_len = bin->header_info[bin_num].reg_byte_len +
+		     bin->header_info[bin_num].data_byte_len;
+	if (!record_len || (bin->header_info[bin_num].bin_data_len - 4) %
+			 record_len)
+		return -EINVAL;
+
+	p_check_sum = &bin->info.data[bin->header_info[bin_num].valid_data_addr];
 	DBG("aw_bin_parse p_check_sum = %p\n", p_check_sum);
 	parse_register_num = GET_32_DATA(*(p_check_sum + 3),
 					 *(p_check_sum + 2),
 					 *(p_check_sum + 1), *(p_check_sum));
 	check_register_num = (bin->header_info[bin_num].bin_data_len - 4) /
-		(bin->header_info[bin_num].reg_byte_len +
-			bin->header_info[bin_num].data_byte_len);
+		record_len;
 	DBG("aw_bin_parse bin_num=%d, parse_register_num = 0x%x, check_register_num = 0x%x\n",
 			bin_num, parse_register_num, check_register_num);
 	if (parse_register_num != check_register_num) {
@@ -146,15 +199,23 @@ int aw_check_register_num_v1(struct aw_bin *bin, int bin_num)
 	return 0;
 }
 
-int aw_check_dsp_reg_num_v1(struct aw_bin *bin, int bin_num)
+static int aw_check_dsp_reg_num_v1(struct aw_bin *bin, int bin_num)
 {
 	unsigned int check_dsp_reg_num = 0;
 	unsigned int parse_dsp_reg_num = 0;
 	char *p_check_sum = NULL;
 
 	DBG("enter\n");
+	if (bin_num < 0 || bin_num >= bin->all_bin_parse_num)
+		return -EINVAL;
 
-	p_check_sum = &(bin->info.data[(bin->header_info[bin_num].valid_data_addr)]);
+	if (bin->header_info[bin_num].bin_data_len < 12 ||
+	    !aw_bin_range_valid(bin,
+		bin->header_info[bin_num].valid_data_addr,
+		bin->header_info[bin_num].bin_data_len))
+		return -EINVAL;
+
+	p_check_sum = &bin->info.data[bin->header_info[bin_num].valid_data_addr];
 	DBG("aw_bin_parse p_check_sum = %p\n", p_check_sum);
 	parse_dsp_reg_num = GET_32_DATA(*(p_check_sum + 7),
 					*(p_check_sum + 6),
@@ -162,6 +223,11 @@ int aw_check_dsp_reg_num_v1(struct aw_bin *bin, int bin_num)
 	bin->header_info[bin_num].reg_data_byte_len =
 	    GET_32_DATA(*(p_check_sum + 11), *(p_check_sum + 10),
 			*(p_check_sum + 9), *(p_check_sum + 8));
+	if (!bin->header_info[bin_num].reg_data_byte_len ||
+	    (bin->header_info[bin_num].bin_data_len - 12) %
+		bin->header_info[bin_num].reg_data_byte_len)
+		return -EINVAL;
+
 	check_dsp_reg_num =
 		(bin->header_info[bin_num].bin_data_len -
 		12) / bin->header_info[bin_num].reg_data_byte_len;
@@ -185,16 +251,23 @@ int aw_check_dsp_reg_num_v1(struct aw_bin *bin, int bin_num)
 	return 0;
 }
 
-int aw_check_soc_app_num_v1(struct aw_bin *bin, int bin_num)
+static int aw_check_soc_app_num_v1(struct aw_bin *bin, int bin_num)
 {
 	unsigned int check_soc_app_num = 0;
 	unsigned int parse_soc_app_num = 0;
 	char *p_check_sum = NULL;
 
 	DBG("enter\n");
+	if (bin_num < 0 || bin_num >= bin->all_bin_parse_num)
+		return -EINVAL;
 
-	p_check_sum =
-	    &(bin->info.data[(bin->header_info[bin_num].valid_data_addr)]);
+	if (bin->header_info[bin_num].bin_data_len < 12 ||
+	    !aw_bin_range_valid(bin,
+		bin->header_info[bin_num].valid_data_addr,
+		bin->header_info[bin_num].bin_data_len))
+		return -EINVAL;
+
+	p_check_sum = &bin->info.data[bin->header_info[bin_num].valid_data_addr];
 	DBG("aw_bin_parse p_check_sum = %p\n", p_check_sum);
 	bin->header_info[bin_num].app_version = GET_32_DATA(*(p_check_sum + 3),
 							    *(p_check_sum + 2),
@@ -230,103 +303,132 @@ int aw_check_soc_app_num_v1(struct aw_bin *bin, int bin_num)
  ***bin header 1_0_0
  ***
  ************************/
-void aw_get_single_bin_header_1_0_0(struct aw_bin *bin)
+static int aw_get_single_bin_header_1_0_0(struct aw_bin *bin)
 {
 	int i = 0;
+	unsigned int offset;
+	struct bin_header_info *header;
 
 	DBG("enter\n");
-	bin->header_info[bin->all_bin_parse_num].header_len = 60;
-	bin->header_info[bin->all_bin_parse_num].check_sum =
+	if (bin->all_bin_parse_num >= BIN_NUM_MAX)
+		return -E2BIG;
+
+	offset = aw_bin_cursor_offset(bin);
+	if (!aw_bin_range_valid(bin, offset, HEADER_LEN))
+		return -EINVAL;
+
+	header = &bin->header_info[bin->all_bin_parse_num];
+	header->header_len = HEADER_LEN;
+	header->check_sum =
 	    GET_32_DATA(*(bin->p_addr + 3), *(bin->p_addr + 2),
 			*(bin->p_addr + 1), *(bin->p_addr));
-	bin->header_info[bin->all_bin_parse_num].header_ver =
+	header->header_ver =
 	    GET_32_DATA(*(bin->p_addr + 7), *(bin->p_addr + 6),
 			*(bin->p_addr + 5), *(bin->p_addr + 4));
-	bin->header_info[bin->all_bin_parse_num].bin_data_type =
+	header->bin_data_type =
 	    GET_32_DATA(*(bin->p_addr + 11), *(bin->p_addr + 10),
 			*(bin->p_addr + 9), *(bin->p_addr + 8));
-	bin->header_info[bin->all_bin_parse_num].bin_data_ver =
+	header->bin_data_ver =
 	    GET_32_DATA(*(bin->p_addr + 15), *(bin->p_addr + 14),
 			*(bin->p_addr + 13), *(bin->p_addr + 12));
-	bin->header_info[bin->all_bin_parse_num].bin_data_len =
+	header->bin_data_len =
 	    GET_32_DATA(*(bin->p_addr + 19), *(bin->p_addr + 18),
 			*(bin->p_addr + 17), *(bin->p_addr + 16));
-	bin->header_info[bin->all_bin_parse_num].ui_ver =
+	if (!aw_bin_range_valid(bin, offset + HEADER_LEN,
+				header->bin_data_len))
+		return -EINVAL;
+
+	header->ui_ver =
 	    GET_32_DATA(*(bin->p_addr + 23), *(bin->p_addr + 22),
 			*(bin->p_addr + 21), *(bin->p_addr + 20));
-	bin->header_info[bin->all_bin_parse_num].reg_byte_len =
+	header->reg_byte_len =
 	    GET_32_DATA(*(bin->p_addr + 35), *(bin->p_addr + 34),
 			*(bin->p_addr + 33), *(bin->p_addr + 32));
-	bin->header_info[bin->all_bin_parse_num].data_byte_len =
+	header->data_byte_len =
 	    GET_32_DATA(*(bin->p_addr + 39), *(bin->p_addr + 38),
 			*(bin->p_addr + 37), *(bin->p_addr + 36));
-	bin->header_info[bin->all_bin_parse_num].device_addr =
+	header->device_addr =
 	    GET_32_DATA(*(bin->p_addr + 43), *(bin->p_addr + 42),
 			*(bin->p_addr + 41), *(bin->p_addr + 40));
-	for (i = 0; i < 8; i++) {
-		bin->header_info[bin->all_bin_parse_num].chip_type[i] =
-		    *(bin->p_addr + 24 + i);
-	}
-	bin->header_info[bin->all_bin_parse_num].reg_num = 0x00000000;
-	bin->header_info[bin->all_bin_parse_num].reg_data_byte_len = 0x00000000;
-	bin->header_info[bin->all_bin_parse_num].download_addr = 0x00000000;
-	bin->header_info[bin->all_bin_parse_num].app_version = 0x00000000;
-	bin->header_info[bin->all_bin_parse_num].valid_data_len = 0x00000000;
+	for (i = 0; i < 8; i++)
+		header->chip_type[i] = *(bin->p_addr + 24 + i);
+	header->valid_data_addr = offset + HEADER_LEN;
+	header->reg_num = 0;
+	header->reg_data_byte_len = 0;
+	header->download_addr = 0;
+	header->app_version = 0;
+	header->valid_data_len = 0;
 	bin->all_bin_parse_num += 1;
-}
 
-int aw_parse_each_of_multi_bins_1_0_0(unsigned int bin_num, int bin_serial_num,
-				      struct aw_bin *bin)
-{
-	int ret = 0;
-	unsigned int bin_start_addr = 0;
-	unsigned int valid_data_len = 0;
-
-	DBG("aw_bin_parse enter multi bin branch -- %s\n", __func__);
-	if (!bin_serial_num) {
-		bin_start_addr = GET_32_DATA(*(bin->p_addr + 67),
-					     *(bin->p_addr + 66),
-					     *(bin->p_addr + 65),
-					     *(bin->p_addr + 64));
-		bin->p_addr += (60 + bin_start_addr);
-		bin->header_info[bin->all_bin_parse_num].valid_data_addr =
-		    bin->header_info[bin->all_bin_parse_num -
-				     1].valid_data_addr + 4 + 8 * bin_num + 60;
-	} else {
-		valid_data_len =
-		    bin->header_info[bin->all_bin_parse_num - 1].bin_data_len;
-		bin->p_addr += (60 + valid_data_len);
-		bin->header_info[bin->all_bin_parse_num].valid_data_addr =
-			bin->header_info[bin->all_bin_parse_num - 1].valid_data_addr +
-			bin->header_info[bin->all_bin_parse_num - 1].bin_data_len + 60;
-	}
-
-	ret = aw_parse_bin_header_1_0_0(bin);
-	return ret;
+	return 0;
 }
 
 /* Get the number of bins in multi bins, and set a for loop, loop processing each bin data */
-int aw_get_multi_bin_header_1_0_0(struct aw_bin *bin)
+static int aw_get_multi_bin_header_1_0_0(struct aw_bin *bin)
 {
 	int i = 0;
 	int ret = 0;
 	unsigned int bin_num = 0;
+	unsigned int bin_start_addr;
+	unsigned int child_offset;
+	unsigned int child_end;
+	unsigned int parent_end;
+	unsigned int parent_index;
+	unsigned int child_index;
+	unsigned int table_len;
+	struct bin_header_info *parent;
 
 	DBG("aw_bin_parse enter multi bin branch -- %s\n", __func__);
-	bin_num = GET_32_DATA(*(bin->p_addr + 63),
-			      *(bin->p_addr + 62),
-			      *(bin->p_addr + 61), *(bin->p_addr + 60));
-	if (bin->multi_bin_parse_num == 1)
-		bin->header_info[bin->all_bin_parse_num].valid_data_addr = 60;
+	parent_index = bin->all_bin_parse_num;
+	ret = aw_get_single_bin_header_1_0_0(bin);
+	if (ret)
+		return ret;
 
-	aw_get_single_bin_header_1_0_0(bin);
+	parent = &bin->header_info[parent_index];
+	if (parent->bin_data_len < sizeof(uint32_t))
+		return -EINVAL;
+
+	bin_num = GET_32_DATA(bin->info.data[parent->valid_data_addr + 3],
+			      bin->info.data[parent->valid_data_addr + 2],
+			      bin->info.data[parent->valid_data_addr + 1],
+			      bin->info.data[parent->valid_data_addr]);
+	if (bin_num > (parent->bin_data_len - sizeof(uint32_t)) / 8)
+		return -EINVAL;
+	table_len = sizeof(uint32_t) + 8 * bin_num;
+	if (!bin_num)
+		return 0;
+
+	bin_start_addr = GET_32_DATA(
+		bin->info.data[parent->valid_data_addr + 7],
+		bin->info.data[parent->valid_data_addr + 6],
+		bin->info.data[parent->valid_data_addr + 5],
+		bin->info.data[parent->valid_data_addr + 4]);
+	if (bin_start_addr < table_len ||
+	    bin_start_addr > parent->bin_data_len ||
+	    parent->bin_data_len - bin_start_addr < HEADER_LEN)
+		return -EINVAL;
+
+	child_offset = parent->valid_data_addr + bin_start_addr;
+	parent_end = parent->valid_data_addr + parent->bin_data_len;
 
 	for (i = 0; i < bin_num; i++) {
 		DBG("aw_bin_parse enter multi bin for is %d\n", i);
-		ret = aw_parse_each_of_multi_bins_1_0_0(bin_num, i, bin);
+		child_index = bin->all_bin_parse_num;
+		ret = aw_bin_set_cursor(bin, child_offset);
+		if (ret)
+			return ret;
+
+		ret = aw_parse_bin_header_1_0_0(bin);
 		if (ret < 0)
 			return ret;
 
+		if (child_index >= bin->all_bin_parse_num)
+			return -EINVAL;
+		child_end = bin->header_info[child_index].valid_data_addr +
+			    bin->header_info[child_index].bin_data_len;
+		if (child_end > parent_end)
+			return -EINVAL;
+		child_offset = child_end;
 	}
 	return 0;
 }
@@ -346,8 +448,13 @@ static int aw_parse_bin_header_1_0_0(struct aw_bin *bin)
 {
 	int ret = 0;
 	unsigned int bin_data_type;
+	unsigned int offset;
 
 	DBG("enter\n");
+	offset = aw_bin_cursor_offset(bin);
+	if (!aw_bin_range_valid(bin, offset, 12))
+		return -EINVAL;
+
 	bin_data_type = GET_32_DATA(*(bin->p_addr + 11),
 				    *(bin->p_addr + 10),
 				    *(bin->p_addr + 9), *(bin->p_addr + 8));
@@ -364,27 +471,19 @@ static int aw_parse_bin_header_1_0_0(struct aw_bin *bin)
 		bin->single_bin_parse_num += 1;
 		DBG("%s bin->single_bin_parse_num is %d\n", __func__,
 			bin->single_bin_parse_num);
-		if (!bin->multi_bin_parse_num)
-			bin->header_info[bin->all_bin_parse_num].valid_data_addr = 60;
-
-		aw_get_single_bin_header_1_0_0(bin);
-		break;
+		return aw_get_single_bin_header_1_0_0(bin);
 	case DATA_TYPE_MULTI_BINS:
 		/* Get the number of times to enter multi bins */
 		DBG("aw_bin_parse enter multi bin branch\n");
 		bin->multi_bin_parse_num += 1;
 		DBG("%s bin->multi_bin_parse_num is %d\n", __func__,
 			bin->multi_bin_parse_num);
-		ret = aw_get_multi_bin_header_1_0_0(bin);
-		if (ret < 0)
-			return ret;
-
-		break;
+		return aw_get_multi_bin_header_1_0_0(bin);
 	default:
 		DBG_ERR("aw_bin_parse Unrecognized this bin data type\n");
 		return -EINVAL;
 	}
-	return 0;
+	return ret;
 }
 
 /* get the bin's header version */
@@ -392,6 +491,10 @@ static int aw_check_bin_header_version(struct aw_bin *bin)
 {
 	int ret = 0;
 	unsigned int header_version = 0;
+	unsigned int offset = aw_bin_cursor_offset(bin);
+
+	if (!aw_bin_range_valid(bin, offset, 8))
+		return -EINVAL;
 
 	header_version = GET_32_DATA(*(bin->p_addr + 7),
 				     *(bin->p_addr + 6),
@@ -420,6 +523,10 @@ static int aw_parsing_bin_file(struct aw_bin *bin)
 	DBG("aw_bin_parse code version:%s\n", AWINIC_CODE_VERSION);
 	if (!bin) {
 		DBG_ERR("aw_bin_parse bin is NULL\n");
+		return -EINVAL;
+	}
+	if (bin->info.len < HEADER_LEN) {
+		DBG_ERR("aw_bin_parse bin is smaller than header\n");
 		return -EINVAL;
 	}
 	bin->p_addr = bin->info.data;
@@ -516,9 +623,8 @@ static int aw_dev_parse_check_acf_by_hdr(struct aw_container *aw_cfg)
 {
 	struct aw_cfg_hdr *cfg_hdr = NULL;
 	struct aw_cfg_dde *cfg_dde = NULL;
-	unsigned int end_data_offset = 0;
-	unsigned int act_data = 0;
-	unsigned int hdr_ddt_len = 0;
+	size_t act_data;
+	size_t hdr_ddt_len;
 	uint8_t act_crc8 = 0;
 	int i;
 
@@ -530,34 +636,57 @@ static int aw_dev_parse_check_acf_by_hdr(struct aw_container *aw_cfg)
 		return -EINVAL;
 	}
 
-	hdr_ddt_len = cfg_hdr->a_hdr_offset + cfg_hdr->a_ddt_size;
-	if (hdr_ddt_len > aw_cfg->len) {
+	if (cfg_hdr->a_hdr_offset < sizeof(*cfg_hdr) ||
+	    cfg_hdr->a_hdr_offset > aw_cfg->len ||
+	    cfg_hdr->a_ddt_size > aw_cfg->len - cfg_hdr->a_hdr_offset ||
+	    cfg_hdr->a_ddt_num > cfg_hdr->a_ddt_size / sizeof(*cfg_dde) ||
+	    cfg_hdr->a_ddt_num * sizeof(*cfg_dde) != cfg_hdr->a_ddt_size) {
 		aw_pr_err("hdrlen with ddt_len [%d] overflow file size[%d]",
-		cfg_hdr->a_hdr_offset, aw_cfg->len);
+			cfg_hdr->a_hdr_offset, aw_cfg->len);
 		return -EINVAL;
 	}
+	hdr_ddt_len = cfg_hdr->a_hdr_offset + cfg_hdr->a_ddt_size;
 
 	/*check data size*/
 	cfg_dde = (struct aw_cfg_dde *)((char *)aw_cfg->data + cfg_hdr->a_hdr_offset);
-	act_data += hdr_ddt_len;
-	for (i = 0; i < cfg_hdr->a_ddt_num; i++)
+	act_data = hdr_ddt_len;
+	for (i = 0; i < cfg_hdr->a_ddt_num; i++) {
+		int j;
+		size_t section_end;
+
+		if (cfg_dde[i].data_type >= ACF_SEC_TYPE_MAX ||
+		    (cfg_dde[i].data_type != ACF_SEC_TYPE_MONITOR &&
+		     cfg_dde[i].dev_profile >= AW_PROFILE_MAX) ||
+		    cfg_dde[i].data_offset < hdr_ddt_len ||
+		    cfg_dde[i].data_offset > aw_cfg->len ||
+		    cfg_dde[i].data_size > aw_cfg->len - cfg_dde[i].data_offset ||
+		    cfg_dde[i].data_size > aw_cfg->len - act_data)
+			return -EINVAL;
+
+		section_end = (size_t)cfg_dde[i].data_offset +
+			      cfg_dde[i].data_size;
+		for (j = 0; j < i; j++) {
+			size_t prev_end = (size_t)cfg_dde[j].data_offset +
+					  cfg_dde[j].data_size;
+
+			if (cfg_dde[i].data_size && cfg_dde[j].data_size &&
+			    cfg_dde[i].data_offset < prev_end &&
+			    cfg_dde[j].data_offset < section_end) {
+				aw_pr_err("acf sections %d and %d overlap", j, i);
+				return -EINVAL;
+			}
+		}
 		act_data += cfg_dde[i].data_size;
+	}
 
 	if (act_data != aw_cfg->len) {
-		aw_pr_err("act_data[%d] not equal to file size[%d]!",
+		aw_pr_err("act_data[%zu] not equal to file size[%d]!",
 			act_data, aw_cfg->len);
 		return -EINVAL;
 	}
 
 	for (i = 0; i < cfg_hdr->a_ddt_num; i++) {
 		/* data check */
-		end_data_offset = cfg_dde[i].data_offset + cfg_dde[i].data_size;
-		if (end_data_offset > aw_cfg->len) {
-			aw_pr_err("a_ddt_num[%d] end_data_offset[%d] overflow file size[%d]",
-				i, end_data_offset, aw_cfg->len);
-			return -EINVAL;
-		}
-
 		/* crc check */
 		act_crc8 = aw_dev_parse_crc8_check(aw_cfg->data + cfg_dde[i].data_offset, cfg_dde[i].data_size);
 		if (act_crc8 != cfg_dde[i].data_crc) {
@@ -567,8 +696,8 @@ static int aw_dev_parse_check_acf_by_hdr(struct aw_container *aw_cfg)
 		}
 	}
 
-	aw_pr_info("project name [%s]", cfg_hdr->a_project);
-	aw_pr_info("custom name [%s]", cfg_hdr->a_custom);
+	aw_pr_info("project name [%.*s]", PROJECT_NAME_MAX, cfg_hdr->a_project);
+	aw_pr_info("custom name [%.*s]", CUSTOMER_NAME_MAX, cfg_hdr->a_custom);
 	aw_pr_info("version name [%d.%d.%d.%d]", cfg_hdr->a_version[3], cfg_hdr->a_version[2],
 						cfg_hdr->a_version[1], cfg_hdr->a_version[0]);
 	aw_pr_info("author id %d", cfg_hdr->a_author_id);
@@ -580,9 +709,8 @@ static int aw_dev_parse_check_acf_by_hdr_v_1_0_0_0(struct aw_container *aw_cfg)
 {
 	struct aw_cfg_hdr *cfg_hdr = NULL;
 	struct aw_cfg_dde_v_1_0_0_0 *cfg_dde = NULL;
-	unsigned int end_data_offset = 0;
-	unsigned int act_data = 0;
-	unsigned int hdr_ddt_len = 0;
+	size_t act_data;
+	size_t hdr_ddt_len;
 	uint8_t act_crc8 = 0;
 	int i;
 
@@ -594,34 +722,61 @@ static int aw_dev_parse_check_acf_by_hdr_v_1_0_0_0(struct aw_container *aw_cfg)
 		return -EINVAL;
 	}
 
-	hdr_ddt_len = cfg_hdr->a_hdr_offset + cfg_hdr->a_ddt_size;
-	if (hdr_ddt_len > aw_cfg->len) {
+	if (cfg_hdr->a_hdr_offset < sizeof(*cfg_hdr) ||
+	    cfg_hdr->a_hdr_offset > aw_cfg->len ||
+	    cfg_hdr->a_ddt_size > aw_cfg->len - cfg_hdr->a_hdr_offset ||
+	    cfg_hdr->a_ddt_num > cfg_hdr->a_ddt_size / sizeof(*cfg_dde) ||
+	    cfg_hdr->a_ddt_num * sizeof(*cfg_dde) != cfg_hdr->a_ddt_size) {
 		aw_pr_err("hdrlen with ddt_len [%d] overflow file size[%d]",
-		cfg_hdr->a_hdr_offset, aw_cfg->len);
+			cfg_hdr->a_hdr_offset, aw_cfg->len);
 		return -EINVAL;
 	}
+	hdr_ddt_len = cfg_hdr->a_hdr_offset + cfg_hdr->a_ddt_size;
 
 	/*check data size*/
 	cfg_dde = (struct aw_cfg_dde_v_1_0_0_0 *)((char *)aw_cfg->data + cfg_hdr->a_hdr_offset);
-	act_data += hdr_ddt_len;
-	for (i = 0; i < cfg_hdr->a_ddt_num; i++)
+	act_data = hdr_ddt_len;
+	for (i = 0; i < cfg_hdr->a_ddt_num; i++) {
+		int j;
+		size_t section_end;
+
+		if (!memchr(cfg_dde[i].dev_profile_str, '\0',
+			    sizeof(cfg_dde[i].dev_profile_str)))
+			return -EINVAL;
+
+		if (cfg_dde[i].data_type >= ACF_SEC_TYPE_MAX ||
+		    (cfg_dde[i].data_type != ACF_SEC_TYPE_MONITOR &&
+		     cfg_dde[i].dev_profile >= AW_PROFILE_MAX) ||
+		    cfg_dde[i].data_offset < hdr_ddt_len ||
+		    cfg_dde[i].data_offset > aw_cfg->len ||
+		    cfg_dde[i].data_size > aw_cfg->len - cfg_dde[i].data_offset ||
+		    cfg_dde[i].data_size > aw_cfg->len - act_data)
+			return -EINVAL;
+
+		section_end = (size_t)cfg_dde[i].data_offset +
+			      cfg_dde[i].data_size;
+		for (j = 0; j < i; j++) {
+			size_t prev_end = (size_t)cfg_dde[j].data_offset +
+					  cfg_dde[j].data_size;
+
+			if (cfg_dde[i].data_size && cfg_dde[j].data_size &&
+			    cfg_dde[i].data_offset < prev_end &&
+			    cfg_dde[j].data_offset < section_end) {
+				aw_pr_err("acf sections %d and %d overlap", j, i);
+				return -EINVAL;
+			}
+		}
 		act_data += cfg_dde[i].data_size;
+	}
 
 	if (act_data != aw_cfg->len) {
-		aw_pr_err("act_data[%d] not equal to file size[%d]!",
+		aw_pr_err("act_data[%zu] not equal to file size[%d]!",
 			act_data, aw_cfg->len);
 		return -EINVAL;
 	}
 
 	for (i = 0; i < cfg_hdr->a_ddt_num; i++) {
 		/* data check */
-		end_data_offset = cfg_dde[i].data_offset + cfg_dde[i].data_size;
-		if (end_data_offset > aw_cfg->len) {
-			aw_pr_err("a_ddt_num[%d] end_data_offset[%d] overflow file size[%d]",
-				i, end_data_offset, aw_cfg->len);
-			return -EINVAL;
-		}
-
 		/* crc check */
 		act_crc8 = aw_dev_parse_crc8_check(aw_cfg->data + cfg_dde[i].data_offset, cfg_dde[i].data_size);
 		if (act_crc8 != cfg_dde[i].data_crc) {
@@ -631,8 +786,8 @@ static int aw_dev_parse_check_acf_by_hdr_v_1_0_0_0(struct aw_container *aw_cfg)
 		}
 	}
 
-	aw_pr_info("project name [%s]", cfg_hdr->a_project);
-	aw_pr_info("custom name [%s]", cfg_hdr->a_custom);
+	aw_pr_info("project name [%.*s]", PROJECT_NAME_MAX, cfg_hdr->a_project);
+	aw_pr_info("custom name [%.*s]", CUSTOMER_NAME_MAX, cfg_hdr->a_custom);
 	aw_pr_info("version name [%d.%d.%d.%d]", cfg_hdr->a_version[3], cfg_hdr->a_version[2],
 						cfg_hdr->a_version[1], cfg_hdr->a_version[0]);
 	aw_pr_info("author id %d", cfg_hdr->a_author_id);
@@ -724,12 +879,14 @@ static int aw_dev_parse_reg_bin_with_hdr(struct aw_device *aw_dev,
 	if ((aw_bin->all_bin_parse_num != 1) ||
 		(aw_bin->header_info[0].bin_data_type != DATA_TYPE_REGISTER)) {
 		aw_dev_err(aw_dev->dev, "bin num or type error");
+		ret = -EINVAL;
 		goto parse_bin_failed;
 	}
 
 	if (aw_bin->header_info[0].valid_data_len % 4) {
 		aw_dev_err(aw_dev->dev, "bin data len get error!");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto parse_bin_failed;
 	}
 
 	prof_desc->sec_desc[AW_PROFILE_DATA_TYPE_REG].data =

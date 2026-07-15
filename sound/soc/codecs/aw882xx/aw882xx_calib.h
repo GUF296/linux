@@ -18,6 +18,7 @@
 #define AW_CALI_READ_F0_Q_TIMES (5)
 #define AW_ERRO_CALI_VALUE (0)
 #define AW_CALI_RE_DEFAULT_TIMER	(3000)
+#define AW_CALI_RE_MAX_TIMER	(30000)
 
 #define AW_CALI_RE_MAX     (15000)
 #define AW_CALI_RE_MIN     (4000)
@@ -181,6 +182,9 @@ struct aw_cali_desc {
 	int32_t cali_q;			/*store cali q*/
 	int8_t cali_result;
 	uint8_t cali_check_st;
+	bool attr_registered;
+	bool class_registered;
+	bool misc_registered;
 };
 
 int aw882xx_cali_init(struct aw_cali_desc *cali_desc);

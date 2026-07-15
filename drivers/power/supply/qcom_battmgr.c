@@ -8,6 +8,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
@@ -313,6 +314,7 @@ struct qcom_battmgr {
 	struct pmic_glink_client *client;
 
 	enum qcom_battmgr_variant variant;
+	bool invert_current_now;
 
 	struct power_supply *ac_psy;
 	struct power_supply *bat_psy;
@@ -1433,7 +1435,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->info.voltage_max = le32_to_cpu(resp->intval.value);
 			break;
 		case BATT_CURR_NOW:
-			if (battmgr->variant == QCOM_BATTMGR_SM8650)
+			if (battmgr->invert_current_now)
 				battmgr->status.current_now = -le32_to_cpu(resp->intval.value);
 			else
 				battmgr->status.current_now = le32_to_cpu(resp->intval.value);
@@ -1662,6 +1664,9 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		battmgr->variant = (unsigned long)match->data;
 	else
 		battmgr->variant = QCOM_BATTMGR_SM8350;
+	battmgr->invert_current_now =
+		battmgr->variant == QCOM_BATTMGR_SM8650 &&
+		of_machine_is_compatible("lenovo,tb321fu");
 
 	ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
 	if (ret < 0)

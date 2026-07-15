@@ -342,6 +342,7 @@ static int y700_ss_power_on(struct device *dev)
 	struct y700_ss *sensor = to_y700_ss(sd);
 	const struct y700_ss_info *info = sensor->info;
 	unsigned int ldo3_uv = y700_ss_sc820cs_ldo3_target_uv(sensor);
+	unsigned int num_enabled = 0;
 	int ret, i;
 
 	for (i = 0; i < info->num_supplies; i++) {
@@ -355,6 +356,7 @@ static int y700_ss_power_on(struct device *dev)
 		ret = regulator_enable(sensor->supplies[i].consumer);
 		if (ret)
 			goto disable_supplies;
+		num_enabled++;
 
 		fsleep(info->supply_delays_us[i]);
 	}
@@ -376,8 +378,8 @@ static int y700_ss_power_on(struct device *dev)
 assert_reset:
 	gpiod_set_value_cansleep(sensor->reset_gpio, 1);
 disable_supplies:
-	while (--i >= 0)
-		regulator_disable(sensor->supplies[i].consumer);
+	while (num_enabled)
+		regulator_disable(sensor->supplies[--num_enabled].consumer);
 
 	return ret;
 }

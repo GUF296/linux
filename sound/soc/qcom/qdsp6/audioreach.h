@@ -2,6 +2,7 @@
 
 #ifndef __AUDIOREACH_H__
 #define __AUDIOREACH_H__
+#include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/soc/qcom/apr.h>
 #include <uapi/sound/snd_ar_tokens.h>
@@ -792,6 +793,10 @@ struct audioreach_connection {
 struct audioreach_graph_info {
 	int id;
 	uint32_t mem_map_handle;
+	struct mutex mem_map_lock;
+	phys_addr_t mem_map_phys;
+	size_t mem_map_size;
+	unsigned int mem_map_users;
 	uint32_t num_sub_graphs;
 	struct list_head sg_list;
 	/* DPCM connection from FE Graph to BE graph */
@@ -906,12 +911,19 @@ void *audioreach_alloc_graph_pkt(struct q6apm *apm,
 				 const struct audioreach_graph_info *info);
 /* Topology specific */
 int audioreach_tplg_init(struct snd_soc_component *component);
+void audioreach_tplg_free_deferred(struct q6apm *apm);
 
 /* Module specific */
 void audioreach_graph_free_buf(struct q6apm_graph *graph);
 int audioreach_send_cmd_sync(struct device *dev, gpr_device_t *gdev, struct gpr_ibasic_rsp_result_t *result,
 			     struct mutex *cmd_lock, gpr_port_t *port, wait_queue_head_t *cmd_wait,
 			     const struct gpr_pkt *pkt, uint32_t rsp_opcode);
+int audioreach_send_cmd_sync_locked(struct device *dev, gpr_device_t *gdev,
+				    struct gpr_ibasic_rsp_result_t *result,
+				    struct mutex *cmd_lock, gpr_port_t *port,
+				    wait_queue_head_t *cmd_wait,
+				    const struct gpr_pkt *pkt,
+				    uint32_t rsp_opcode);
 int audioreach_graph_send_cmd_sync(struct q6apm_graph *graph, const struct gpr_pkt *pkt,
 				   uint32_t rsp_opcode);
 int audioreach_set_media_format(struct q6apm_graph *graph,

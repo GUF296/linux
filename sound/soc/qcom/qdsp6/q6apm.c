@@ -28,39 +28,140 @@ struct apm_graph_mgmt_cmd {
 #define APM_GRAPH_MGMT_PSIZE(p, n) ALIGN(struct_size(p, sub_graph_id_list, n), 8)
 
 static struct q6apm *g_apm;
+static DEFINE_MUTEX(g_apm_lock);
+static atomic_t q6apm_token = ATOMIC_INIT(0);
+
+uint32_t q6apm_next_token(void)
+{
+	uint32_t token;
+
+	do {
+		token = (uint32_t)atomic_inc_return(&q6apm_token);
+	} while (!token);
+
+	return token;
+}
+
+static void q6apm_release(struct kref *ref)
+{
+	struct q6apm *apm = container_of(ref, struct q6apm, refcount);
+
+	WARN_ON(atomic_read(&apm->active_graphs));
+	WARN_ON(!idr_is_empty(&apm->graph_idr));
+	WARN_ON(!idr_is_empty(&apm->graph_info_idr));
+	WARN_ON(!idr_is_empty(&apm->sub_graphs_idr));
+	WARN_ON(!idr_is_empty(&apm->containers_idr));
+	WARN_ON(!idr_is_empty(&apm->modules_idr));
+	idr_destroy(&apm->graph_idr);
+	idr_destroy(&apm->graph_info_idr);
+	idr_destroy(&apm->sub_graphs_idr);
+	idr_destroy(&apm->containers_idr);
+	idr_destroy(&apm->modules_idr);
+	kfree(apm);
+}
 
 int q6apm_send_cmd_sync(struct q6apm *apm, const struct gpr_pkt *pkt,
 			uint32_t rsp_opcode)
 {
 	gpr_device_t *gdev = apm->gdev;
+	struct gpr_pkt *tx_pkt = (struct gpr_pkt *)pkt;
+	uint32_t graph_id;
+	int ret;
 
-	return audioreach_send_cmd_sync(&gdev->dev, gdev, &apm->result, &apm->lock,
-					NULL, &apm->wait, pkt, rsp_opcode);
+	mutex_lock(&apm->online_lock);
+	if (!READ_ONCE(apm->online)) {
+		ret = -ENETRESET;
+		goto unlock;
+	}
+
+	mutex_lock(&apm->cmd_lock);
+	graph_id = tx_pkt->hdr.token;
+	mutex_lock(&apm->response_lock);
+	tx_pkt->hdr.token = q6apm_next_token();
+	apm->pending_token = tx_pkt->hdr.token;
+	apm->pending_opcode = tx_pkt->hdr.opcode;
+	apm->pending_graph_id = graph_id;
+	apm->response_pending = true;
+	mutex_unlock(&apm->response_lock);
+
+	ret = audioreach_send_cmd_sync_locked(&gdev->dev, gdev,
+					      &apm->result, &apm->cmd_lock,
+					      NULL, &apm->wait, pkt,
+					      rsp_opcode);
+	mutex_lock(&apm->response_lock);
+	apm->response_pending = false;
+	mutex_unlock(&apm->response_lock);
+	mutex_unlock(&apm->cmd_lock);
+unlock:
+	mutex_unlock(&apm->online_lock);
+	return ret;
 }
+
+static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph,
+				     uint32_t opcode);
 
 static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
 {
 	struct audioreach_graph_info *info;
 	struct audioreach_graph *graph;
-	int id;
+	int generation, id, ret;
+
+retry:
+	down_read(&apm->graph_lock);
+	if (!READ_ONCE(apm->online)) {
+		graph = ERR_PTR(-ENETRESET);
+		goto unlock_read;
+	}
 
 	mutex_lock(&apm->lock);
 	graph = idr_find(&apm->graph_idr, graph_id);
+	if (graph && kref_get_unless_zero(&graph->refcount)) {
+		mutex_unlock(&apm->lock);
+		goto unlock_read;
+	}
+	generation = atomic_read(&apm->graph_generation);
 	mutex_unlock(&apm->lock);
-
+	up_read(&apm->graph_lock);
 	if (graph) {
-		kref_get(&graph->refcount);
-		return graph;
+		wait_event(apm->graph_wait,
+			   atomic_read(&apm->graph_generation) != generation);
+		goto retry;
 	}
 
-	info = idr_find(&apm->graph_info_idr, graph_id);
+	down_write(&apm->graph_lock);
+	if (!READ_ONCE(apm->online)) {
+		graph = ERR_PTR(-ENETRESET);
+		goto unlock_write;
+	}
 
-	if (!info)
-		return ERR_PTR(-ENODEV);
+	/* Another opener may have populated the cache before we got write access. */
+	mutex_lock(&apm->lock);
+	graph = idr_find(&apm->graph_idr, graph_id);
+	if (graph && kref_get_unless_zero(&graph->refcount)) {
+		mutex_unlock(&apm->lock);
+		goto unlock_write;
+	}
+	if (graph) {
+		generation = atomic_read(&apm->graph_generation);
+		mutex_unlock(&apm->lock);
+		up_write(&apm->graph_lock);
+		wait_event(apm->graph_wait,
+			   atomic_read(&apm->graph_generation) != generation);
+		goto retry;
+	}
+	info = idr_find(&apm->graph_info_idr, graph_id);
+	mutex_unlock(&apm->lock);
+
+	if (!info) {
+		graph = ERR_PTR(-ENODEV);
+		goto unlock_write;
+	}
 
 	graph = kzalloc_obj(*graph);
-	if (!graph)
-		return ERR_PTR(-ENOMEM);
+	if (!graph) {
+		graph = ERR_PTR(-ENOMEM);
+		goto unlock_write;
+	}
 
 	graph->apm = apm;
 	graph->info = info;
@@ -71,24 +172,44 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 		void *err = graph->graph;
 
 		kfree(graph);
-		return ERR_CAST(err);
+		graph = ERR_CAST(err);
+		goto unlock_write;
+	}
+
+	kref_init(&graph->refcount);
+	mutex_init(&graph->state_lock);
+
+	ret = q6apm_send_cmd_sync(apm, graph->graph, 0);
+	if (ret) {
+		kfree(graph->graph);
+		kfree(graph);
+		graph = ERR_PTR(ret);
+		goto unlock_write;
 	}
 
 	mutex_lock(&apm->lock);
 	id = idr_alloc(&apm->graph_idr, graph, graph_id, graph_id + 1, GFP_KERNEL);
 	if (id < 0) {
 		dev_err(apm->dev, "Unable to allocate graph id (%d)\n", graph_id);
+		mutex_unlock(&apm->lock);
+		audioreach_graph_mgmt_cmd(graph, APM_CMD_GRAPH_CLOSE);
 		kfree(graph->graph);
 		kfree(graph);
-		mutex_unlock(&apm->lock);
-		return ERR_PTR(id);
+		graph = ERR_PTR(id);
+		goto unlock_write;
 	}
 	mutex_unlock(&apm->lock);
 
-	kref_init(&graph->refcount);
+	kref_get(&apm->refcount);
+	atomic_inc(&apm->active_graphs);
+	up_write(&apm->graph_lock);
+	return graph;
 
-	q6apm_send_cmd_sync(apm, graph->graph, 0);
-
+unlock_read:
+	up_read(&apm->graph_lock);
+	return graph;
+unlock_write:
+	up_write(&apm->graph_lock);
 	return graph;
 }
 
@@ -124,40 +245,63 @@ static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph, uint32_t op
 static void q6apm_put_audioreach_graph(struct kref *ref)
 {
 	struct audioreach_graph *graph;
+	struct audioreach_graph *removed;
 	struct q6apm *apm;
+	int ret;
 
 	graph = container_of(ref, struct audioreach_graph, refcount);
 	apm = graph->apm;
 
-	audioreach_graph_mgmt_cmd(graph, APM_CMD_GRAPH_CLOSE);
+	if (READ_ONCE(apm->online)) {
+		ret = audioreach_graph_mgmt_cmd(graph, APM_CMD_GRAPH_CLOSE);
+		if (ret)
+			dev_warn(apm->dev, "failed to close graph %u: %d\n",
+				 graph->id, ret);
+	}
 
 	mutex_lock(&apm->lock);
-	graph = idr_remove(&apm->graph_idr, graph->id);
+	removed = idr_remove(&apm->graph_idr, graph->id);
 	mutex_unlock(&apm->lock);
+	WARN_ON(removed != graph);
 
 	kfree(graph->graph);
 	kfree(graph);
+	if (atomic_dec_and_test(&apm->active_graphs)) {
+		down_write(&apm->graph_lock);
+		audioreach_tplg_free_deferred(apm);
+		up_write(&apm->graph_lock);
+	}
+	atomic_inc(&apm->graph_generation);
+	wake_up_all(&apm->graph_wait);
+	kref_put(&apm->refcount, q6apm_release);
 }
 
 
 static int q6apm_get_apm_state(struct q6apm *apm)
 {
+	int ret;
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(0,
 								APM_CMD_GET_SPF_STATE, 0);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
-	q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
+	ret = q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
+	if (ret)
+		return ret;
 
 	return apm->state;
 }
 
 bool q6apm_is_adsp_ready(void)
 {
-	if (g_apm)
-		return q6apm_get_apm_state(g_apm);
+	int state = -ENODEV;
 
-	return false;
+	mutex_lock(&g_apm_lock);
+	if (g_apm)
+		state = q6apm_get_apm_state(g_apm);
+	mutex_unlock(&g_apm_lock);
+
+	return state > 0;
 }
 EXPORT_SYMBOL_GPL(q6apm_is_adsp_ready);
 
@@ -194,9 +338,7 @@ int q6apm_graph_media_format_shmem(struct q6apm_graph *graph,
 	if (!module)
 		return -ENODEV;
 
-	audioreach_set_media_format(graph, module, cfg);
-
-	return 0;
+	return audioreach_set_media_format(graph, module, cfg);
 
 }
 EXPORT_SYMBOL_GPL(q6apm_graph_media_format_shmem);
@@ -204,27 +346,60 @@ EXPORT_SYMBOL_GPL(q6apm_graph_media_format_shmem);
 int q6apm_map_memory_fixed_region(struct device *dev, unsigned int graph_id, phys_addr_t phys,
 				  size_t sz)
 {
+	struct audioreach_graph *cached_graph;
 	struct audioreach_graph_info *info;
 	struct q6apm *apm = dev_get_drvdata(dev->parent);
 	struct apm_shared_map_region_payload *mregions;
 	struct apm_cmd_shared_mem_map_regions *cmd;
 	int payload_size = sizeof(*cmd) + (sizeof(*mregions));
 	uint32_t buf_sz;
+	int ret;
 	void *p;
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(payload_size,
 						APM_CMD_SHARED_MEM_MAP_REGIONS, graph_id);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
+	if (!sz || sz > U32_MAX - (SZ_4K - 1))
+		return -EINVAL;
+	/* DSP expects size should be aligned to 4K. */
+	buf_sz = ALIGN(sz, SZ_4K);
 
+	mutex_lock(&apm->lock);
+	cached_graph = idr_find(&apm->graph_idr, graph_id);
+	if (cached_graph && !kref_get_unless_zero(&cached_graph->refcount))
+		cached_graph = NULL;
+	mutex_unlock(&apm->lock);
+	if (!cached_graph)
+		down_read(&apm->graph_lock);
+
+	mutex_lock(&apm->lock);
 	info = idr_find(&apm->graph_info_idr, graph_id);
-	if (!info)
-		return -ENODEV;
+	if (!info) {
+		mutex_unlock(&apm->lock);
+		ret = -ENODEV;
+		goto unlock_graph;
+	}
+	mutex_unlock(&apm->lock);
 
-	if (info->mem_map_handle)
-		return 0;
-
-	/* DSP expects size should be aligned to 4K */
-	buf_sz = ALIGN(sz, 4096);
+	mutex_lock(&info->mem_map_lock);
+	mutex_lock(&apm->lock);
+	if (info->mem_map_handle) {
+		if (info->mem_map_phys != phys || info->mem_map_size != buf_sz) {
+			mutex_unlock(&apm->lock);
+			ret = -EBUSY;
+			goto unlock_map;
+		}
+		if (info->mem_map_users == UINT_MAX) {
+			mutex_unlock(&apm->lock);
+			ret = -EOVERFLOW;
+			goto unlock_map;
+		}
+		info->mem_map_users++;
+		mutex_unlock(&apm->lock);
+		ret = 0;
+		goto unlock_map;
+	}
+	mutex_unlock(&apm->lock);
 
 	p = (void *)pkt + GPR_HDR_SIZE;
 	cmd = p;
@@ -238,7 +413,24 @@ int q6apm_map_memory_fixed_region(struct device *dev, unsigned int graph_id, phy
 	mregions->shm_addr_msw = upper_32_bits(phys);
 	mregions->mem_size_bytes = buf_sz;
 
-	return q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_SHARED_MEM_MAP_REGIONS);
+	ret = q6apm_send_cmd_sync(apm, pkt,
+				  APM_CMD_RSP_SHARED_MEM_MAP_REGIONS);
+	if (!ret) {
+		mutex_lock(&apm->lock);
+		info->mem_map_phys = phys;
+		info->mem_map_size = buf_sz;
+		info->mem_map_users = 1;
+		mutex_unlock(&apm->lock);
+	}
+unlock_map:
+	mutex_unlock(&info->mem_map_lock);
+unlock_graph:
+	if (cached_graph)
+		kref_put(&cached_graph->refcount,
+			 q6apm_put_audioreach_graph);
+	else
+		up_read(&apm->graph_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(q6apm_map_memory_fixed_region);
 
@@ -297,23 +489,68 @@ int q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int graph_id)
 {
 	struct apm_cmd_shared_mem_unmap_regions *cmd;
 	struct q6apm *apm = dev_get_drvdata(dev->parent);
+	struct audioreach_graph *cached_graph;
 	struct audioreach_graph_info *info;
+	uint32_t mem_map_handle;
+	int ret;
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(sizeof(*cmd),
 						APM_CMD_SHARED_MEM_UNMAP_REGIONS, graph_id);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
-	info = idr_find(&apm->graph_info_idr, graph_id);
-	if (!info)
-		return -ENODEV;
+	mutex_lock(&apm->lock);
+	cached_graph = idr_find(&apm->graph_idr, graph_id);
+	if (cached_graph && !kref_get_unless_zero(&cached_graph->refcount))
+		cached_graph = NULL;
+	mutex_unlock(&apm->lock);
+	if (!cached_graph)
+		down_read(&apm->graph_lock);
 
-	if (!info->mem_map_handle)
-		return 0;
+	mutex_lock(&apm->lock);
+	info = idr_find(&apm->graph_info_idr, graph_id);
+	if (!info) {
+		mutex_unlock(&apm->lock);
+		ret = -ENODEV;
+		goto unlock_graph;
+	}
+	mutex_unlock(&apm->lock);
+
+	mutex_lock(&info->mem_map_lock);
+	mutex_lock(&apm->lock);
+	mem_map_handle = info->mem_map_handle;
+	if (mem_map_handle && info->mem_map_users > 1) {
+		info->mem_map_users--;
+		mutex_unlock(&apm->lock);
+		ret = 0;
+		goto unlock_map;
+	}
+	mutex_unlock(&apm->lock);
+	if (!mem_map_handle) {
+		ret = 0;
+		goto unlock_map;
+	}
 
 	cmd = (void *)pkt + GPR_HDR_SIZE;
-	cmd->mem_map_handle = info->mem_map_handle;
+	cmd->mem_map_handle = mem_map_handle;
 
-	return q6apm_send_cmd_sync(apm, pkt, APM_CMD_SHARED_MEM_UNMAP_REGIONS);
+	ret = q6apm_send_cmd_sync(apm, pkt,
+				  APM_CMD_SHARED_MEM_UNMAP_REGIONS);
+	if (!ret) {
+		mutex_lock(&apm->lock);
+		info->mem_map_phys = 0;
+		info->mem_map_size = 0;
+		info->mem_map_users = 0;
+		mutex_unlock(&apm->lock);
+	}
+unlock_map:
+	mutex_unlock(&info->mem_map_lock);
+unlock_graph:
+	if (cached_graph)
+		kref_put(&cached_graph->refcount,
+			 q6apm_put_audioreach_graph);
+	else
+		up_read(&apm->graph_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(q6apm_unmap_memory_fixed_region);
 
@@ -399,6 +636,7 @@ int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_mo
 	struct audioreach_sub_graph *sgs;
 	struct audioreach_container *container;
 	struct audioreach_module *module;
+	int ret;
 
 	list_for_each_entry(sgs, &info->sg_list, node) {
 		list_for_each_entry(container, &sgs->container_list, node) {
@@ -407,7 +645,9 @@ int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_mo
 					(module->module_id == MODULE_ID_RD_SHARED_MEM_EP))
 					continue;
 
-				audioreach_set_media_format(graph, module, cfg);
+				ret = audioreach_set_media_format(graph, module, cfg);
+				if (ret)
+					return ret;
 			}
 		}
 	}
@@ -442,23 +682,90 @@ int q6apm_graph_get_rx_shmem_module_iid(struct q6apm_graph *graph)
 }
 EXPORT_SYMBOL_GPL(q6apm_graph_get_rx_shmem_module_iid);
 
+static int q6apm_find_inflight_buffer(const struct audioreach_graph_data *data,
+				       uint32_t token)
+{
+	uint32_t i;
+
+	for (i = 0; i < data->num_periods; i++) {
+		if (data->buf[i].in_flight && data->buf[i].token == token)
+			return i;
+	}
+
+	return -ENOENT;
+}
+
+static void q6apm_reset_graph_data(struct audioreach_graph_data *data)
+{
+	uint32_t i;
+
+	for (i = 0; i < data->num_periods; i++) {
+		data->buf[i].submitted = 0;
+		data->buf[i].token = 0;
+		data->buf[i].in_flight = false;
+	}
+	data->dsp_buf = 0;
+	atomic_set(&data->hw_ptr, 0);
+}
+
+static bool q6apm_graph_data_idle(const struct audioreach_graph_data *data)
+{
+	uint32_t i;
+
+	for (i = 0; i < data->num_periods; i++) {
+		if (data->buf[i].in_flight)
+			return false;
+	}
+
+	return true;
+}
+
+static bool q6apm_graph_client_idle_locked(const struct q6apm_graph *graph)
+{
+	return !graph->flushing && !graph->eos_pending &&
+		q6apm_graph_data_idle(&graph->rx_data) &&
+		q6apm_graph_data_idle(&graph->tx_data);
+}
+
 int q6apm_write_async(struct q6apm_graph *graph, uint32_t len, uint32_t msw_ts,
-		      uint32_t lsw_ts, uint32_t wflags)
+			      uint32_t lsw_ts, uint32_t wflags)
 {
 	struct apm_data_cmd_wr_sh_mem_ep_data_buffer_v2 *write_buffer;
 	struct audio_buffer *ab;
-
-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_pkt(sizeof(*write_buffer),
-					DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2,
-					graph->rx_data.dsp_buf | (len << APM_WRITE_TOKEN_LEN_SHIFT),
-					graph->port->id, graph->shm_iid);
-	if (IS_ERR(pkt))
-		return PTR_ERR(pkt);
-
-	write_buffer = (void *)pkt + GPR_HDR_SIZE;
+	struct gpr_pkt *pkt;
+	uint32_t token;
+	int ret;
 
 	mutex_lock(&graph->lock);
+	if (graph->flushing) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	if (!graph->rx_data.buf || !graph->rx_data.num_periods ||
+	    graph->rx_data.dsp_buf >= graph->rx_data.num_periods) {
+		ret = -ENODATA;
+		goto unlock;
+	}
+
 	ab = &graph->rx_data.buf[graph->rx_data.dsp_buf];
+	if (ab->in_flight) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	if (!len || len > ab->size) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	token = q6apm_next_token();
+
+	pkt = audioreach_alloc_pkt(sizeof(*write_buffer),
+				   DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2,
+				   token, graph->port->id, graph->shm_iid);
+	if (IS_ERR(pkt)) {
+		ret = PTR_ERR(pkt);
+		goto unlock;
+	}
+	write_buffer = (void *)pkt + GPR_HDR_SIZE;
 
 	write_buffer->buf_addr_lsw = lower_32_bits(ab->phys);
 	write_buffer->buf_addr_msw = upper_32_bits(ab->phys);
@@ -468,14 +775,22 @@ int q6apm_write_async(struct q6apm_graph *graph, uint32_t len, uint32_t msw_ts,
 	write_buffer->mem_map_handle = graph->info->mem_map_handle;
 	write_buffer->flags = wflags;
 
-	graph->rx_data.dsp_buf++;
+	ret = gpr_send_port_pkt(graph->port, pkt);
+	kfree(pkt);
+	if (ret < 0)
+		goto unlock;
 
+	ab->submitted = len;
+	ab->token = token;
+	ab->in_flight = true;
+	graph->rx_data.dsp_buf++;
 	if (graph->rx_data.dsp_buf >= graph->rx_data.num_periods)
 		graph->rx_data.dsp_buf = 0;
+	ret = 0;
 
+unlock:
 	mutex_unlock(&graph->lock);
-
-	return gpr_send_port_pkt(graph->port, pkt);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(q6apm_write_async);
 
@@ -485,31 +800,58 @@ int q6apm_read(struct q6apm_graph *graph)
 	struct audioreach_graph_data *port;
 	struct audio_buffer *ab;
 
-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_pkt(sizeof(*read_buffer),
-					DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2,
-					graph->tx_data.dsp_buf, graph->port->id, graph->shm_iid);
-	if (IS_ERR(pkt))
-		return PTR_ERR(pkt);
-
-	read_buffer = (void *)pkt + GPR_HDR_SIZE;
+	struct gpr_pkt *pkt;
+	uint32_t token;
+	int ret;
 
 	mutex_lock(&graph->lock);
 	port = &graph->tx_data;
+	if (graph->flushing) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	if (!port->buf || !port->num_periods ||
+	    port->dsp_buf >= port->num_periods) {
+		ret = -ENODATA;
+		goto unlock;
+	}
 	ab = &port->buf[port->dsp_buf];
+	if (ab->in_flight) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	token = q6apm_next_token();
+	pkt = audioreach_alloc_pkt(sizeof(*read_buffer),
+				   DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2,
+				   token, graph->port->id, graph->shm_iid);
+	if (IS_ERR(pkt)) {
+		ret = PTR_ERR(pkt);
+		goto unlock;
+	}
+	read_buffer = (void *)pkt + GPR_HDR_SIZE;
 
 	read_buffer->buf_addr_lsw = lower_32_bits(ab->phys);
 	read_buffer->buf_addr_msw = upper_32_bits(ab->phys);
 	read_buffer->mem_map_handle = graph->info->mem_map_handle;
 	read_buffer->buf_size = ab->size;
 
+	ret = gpr_send_port_pkt(graph->port, pkt);
+	kfree(pkt);
+	if (ret < 0)
+		goto unlock;
+
+	ab->submitted = ab->size;
+	ab->token = token;
+	ab->in_flight = true;
 	port->dsp_buf++;
 
 	if (port->dsp_buf >= port->num_periods)
 		port->dsp_buf = 0;
+	ret = 0;
 
+unlock:
 	mutex_unlock(&graph->lock);
-
-	return gpr_send_port_pkt(graph->port, pkt);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(q6apm_read);
 
@@ -535,64 +877,170 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 	const struct gpr_hdr *hdr = &data->hdr;
 	struct device *dev = graph->dev;
 	uint32_t client_event;
+	uint32_t bytes = 0;
 	phys_addr_t phys;
-	int token;
+	bool failed;
+	int buffer;
 
 	result = data->payload;
 
 	switch (hdr->opcode) {
 	case DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2:
-		if (!graph->ar_graph)
+		if (data->payload_size < sizeof(*done)) {
+			dev_err(dev, "short write-done response: %d bytes\n",
+				data->payload_size);
 			break;
+		}
 		client_event = APM_CLIENT_EVENT_DATA_WRITE_DONE;
-		mutex_lock(&graph->lock);
-		token = hdr->token & APM_WRITE_TOKEN_MASK;
-
 		done = data->payload;
-		phys = graph->rx_data.buf[token].phys;
-		mutex_unlock(&graph->lock);
-		/* token numbering starts at 0 */
-		atomic_set(&graph->rx_data.hw_ptr, token + 1);
-		if (lower_32_bits(phys) == done->buf_addr_lsw &&
-		    upper_32_bits(phys) == done->buf_addr_msw) {
-			graph->result.opcode = hdr->opcode;
-			graph->result.status = done->status;
-			if (graph->cb)
-				graph->cb(client_event, hdr->token, data->payload, graph->priv);
-		} else {
+		mutex_lock(&graph->callback_lock);
+		mutex_lock(&graph->lock);
+		if (!graph->ar_graph || !graph->rx_data.buf ||
+		    !graph->rx_data.num_periods) {
+			mutex_unlock(&graph->lock);
+			mutex_unlock(&graph->callback_lock);
+			break;
+		}
+		buffer = q6apm_find_inflight_buffer(&graph->rx_data,
+						      hdr->token);
+		if (buffer < 0) {
+			mutex_unlock(&graph->lock);
+			mutex_unlock(&graph->callback_lock);
+			dev_dbg(dev, "ignoring stale write-done token %u\n",
+				hdr->token);
+			break;
+		}
+		phys = graph->rx_data.buf[buffer].phys;
+		bytes = graph->rx_data.buf[buffer].submitted;
+		failed = !bytes || bytes > graph->rx_data.buf[buffer].size;
+		if (failed) {
+			dev_err(dev, "invalid submitted size %u for write token %d\n",
+				bytes, buffer);
+		}
+		if (lower_32_bits(phys) != done->buf_addr_lsw ||
+		    upper_32_bits(phys) != done->buf_addr_msw) {
 			dev_err(dev, "WR BUFF Unexpected addr %08x-%08x\n", done->buf_addr_lsw,
 				done->buf_addr_msw);
+			failed = true;
 		}
+		graph->rx_data.buf[buffer].submitted = 0;
+		graph->rx_data.buf[buffer].token = 0;
+		graph->rx_data.buf[buffer].in_flight = false;
+		atomic_set(&graph->rx_data.hw_ptr, buffer + 1);
+		mutex_unlock(&graph->lock);
+		wake_up_all(&graph->data_wait);
+		if (failed || done->status) {
+			dev_err(dev, "write-done failed for token %d: %u\n",
+				buffer, done->status);
+			bytes = 0;
+		}
+		if (graph->cb)
+			graph->cb(client_event, buffer, bytes,
+				  data->payload, graph->priv);
+		mutex_unlock(&graph->callback_lock);
 
 		break;
 	case DATA_CMD_RSP_RD_SH_MEM_EP_DATA_BUFFER_V2:
-		if (!graph->ar_graph)
+		if (data->payload_size < sizeof(*rd_done)) {
+			dev_err(dev, "short read-done response: %d bytes\n",
+				data->payload_size);
 			break;
+		}
 		client_event = APM_CLIENT_EVENT_DATA_READ_DONE;
-		mutex_lock(&graph->lock);
 		rd_done = data->payload;
-		phys = graph->tx_data.buf[hdr->token].phys;
-		mutex_unlock(&graph->lock);
-		/* token numbering starts at 0 */
-		atomic_set(&graph->tx_data.hw_ptr, hdr->token + 1);
-
-		if (upper_32_bits(phys) == rd_done->buf_addr_msw &&
-		    lower_32_bits(phys) == rd_done->buf_addr_lsw) {
-			graph->result.opcode = hdr->opcode;
-			graph->result.status = rd_done->status;
-			if (graph->cb)
-				graph->cb(client_event, hdr->token, data->payload, graph->priv);
-		} else {
+		mutex_lock(&graph->callback_lock);
+		mutex_lock(&graph->lock);
+		if (!graph->ar_graph || !graph->tx_data.buf ||
+		    !graph->tx_data.num_periods) {
+			mutex_unlock(&graph->lock);
+			mutex_unlock(&graph->callback_lock);
+			break;
+		}
+		buffer = q6apm_find_inflight_buffer(&graph->tx_data,
+						      hdr->token);
+		if (buffer < 0) {
+			mutex_unlock(&graph->lock);
+			mutex_unlock(&graph->callback_lock);
+			dev_dbg(dev, "ignoring stale read-done token %u\n",
+				hdr->token);
+			break;
+		}
+		phys = graph->tx_data.buf[buffer].phys;
+		failed = rd_done->data_size > graph->tx_data.buf[buffer].size;
+		if (failed) {
+			dev_err(dev, "read-done size %u exceeds buffer %u\n",
+				rd_done->data_size,
+				graph->tx_data.buf[buffer].size);
+		}
+		if (upper_32_bits(phys) != rd_done->buf_addr_msw ||
+		    lower_32_bits(phys) != rd_done->buf_addr_lsw) {
 			dev_err(dev, "RD BUFF Unexpected addr %08x-%08x\n", rd_done->buf_addr_lsw,
 				rd_done->buf_addr_msw);
+			failed = true;
 		}
+		graph->tx_data.buf[buffer].submitted = 0;
+		graph->tx_data.buf[buffer].token = 0;
+		graph->tx_data.buf[buffer].in_flight = false;
+		atomic_set(&graph->tx_data.hw_ptr, buffer + 1);
+		mutex_unlock(&graph->lock);
+		wake_up_all(&graph->data_wait);
+		bytes = failed || rd_done->status ? 0 : rd_done->data_size;
+		if (failed || rd_done->status)
+			dev_err(dev, "read-done failed for token %d: %u\n",
+				buffer, rd_done->status);
+		if (graph->cb)
+			graph->cb(client_event, buffer, bytes,
+				  data->payload, graph->priv);
+		mutex_unlock(&graph->callback_lock);
 		break;
 	case DATA_CMD_WR_SH_MEM_EP_EOS_RENDERED:
 		client_event = APM_CLIENT_EVENT_CMD_EOS_DONE;
+		mutex_lock(&graph->callback_lock);
+		mutex_lock(&graph->lock);
+		if (!graph->ar_graph || !graph->eos_pending ||
+		    hdr->token != graph->pending_eos_token) {
+			mutex_unlock(&graph->lock);
+			mutex_unlock(&graph->callback_lock);
+			dev_dbg(dev, "ignoring stale EOS token %u\n", hdr->token);
+			break;
+		}
+		graph->eos_pending = false;
+		mutex_unlock(&graph->lock);
+		wake_up_all(&graph->data_wait);
 		if (graph->cb)
-			graph->cb(client_event, hdr->token, data->payload, graph->priv);
+			graph->cb(client_event, hdr->token, 0,
+				  data->payload, graph->priv);
+		mutex_unlock(&graph->callback_lock);
 		break;
 	case GPR_BASIC_RSP_RESULT:
+		mutex_lock(&graph->response_lock);
+		if (!graph->command_pending ||
+		    hdr->token != graph->pending_cmd_token) {
+			mutex_unlock(&graph->response_lock);
+			dev_dbg(dev,
+				"ignoring stale graph response 0x%08x token %u\n",
+				hdr->opcode, hdr->token);
+			break;
+		}
+		if (data->payload_size < sizeof(*result)) {
+			dev_err(dev, "short graph basic response: %d bytes\n",
+				data->payload_size);
+			graph->result.opcode = graph->pending_cmd_opcode;
+			graph->result.status = 1;
+			wake_up(&graph->cmd_wait);
+			mutex_unlock(&graph->response_lock);
+			break;
+		}
+		if (result->opcode != graph->pending_cmd_opcode) {
+			dev_err(dev,
+				"graph response opcode mismatch: expected 0x%08x got 0x%08x\n",
+				graph->pending_cmd_opcode, result->opcode);
+			graph->result.opcode = graph->pending_cmd_opcode;
+			graph->result.status = 1;
+			wake_up(&graph->cmd_wait);
+			mutex_unlock(&graph->response_lock);
+			break;
+		}
 		switch (result->opcode) {
 		case APM_CMD_SHARED_MEM_MAP_REGIONS:
 		case DATA_CMD_WR_SH_MEM_EP_MEDIA_FORMAT:
@@ -607,6 +1055,7 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 		default:
 			break;
 		}
+		mutex_unlock(&graph->response_lock);
 		break;
 	default:
 		break;
@@ -641,15 +1090,24 @@ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
 	graph->ar_graph = ar_graph;
 	graph->id = ar_graph->id;
 	graph->dev = dev;
+	mutex_lock(&ar_graph->state_lock);
+	graph->flush_generation = ar_graph->flush_generation;
+	mutex_unlock(&ar_graph->state_lock);
 
 	if (dir == SNDRV_PCM_STREAM_PLAYBACK)
-		graph->shm_iid = q6apm_graph_get_rx_shmem_module_iid(graph);
+		ret = q6apm_graph_get_rx_shmem_module_iid(graph);
 	else
-		graph->shm_iid = q6apm_graph_get_tx_shmem_module_iid(graph);
+		ret = q6apm_graph_get_tx_shmem_module_iid(graph);
+	if (ret < 0)
+		goto free_graph;
+	graph->shm_iid = ret;
 
 
 	mutex_init(&graph->lock);
+	mutex_init(&graph->callback_lock);
+	mutex_init(&graph->response_lock);
 	init_waitqueue_head(&graph->cmd_wait);
+	init_waitqueue_head(&graph->data_wait);
 
 	graph->port = gpr_alloc_port(apm->gdev, dev, graph_callback, graph);
 	if (IS_ERR(graph->port)) {
@@ -671,9 +1129,12 @@ int q6apm_graph_close(struct q6apm_graph *graph)
 {
 	struct audioreach_graph *ar_graph = graph->ar_graph;
 
-	graph->ar_graph = NULL;
-	kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);
 	gpr_free_port(graph->port);
+	graph->port = NULL;
+	mutex_lock(&graph->lock);
+	graph->ar_graph = NULL;
+	mutex_unlock(&graph->lock);
+	kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);
 	kfree(graph);
 
 	return 0;
@@ -691,29 +1152,214 @@ int q6apm_graph_start(struct q6apm_graph *graph)
 	struct audioreach_graph *ar_graph = graph->ar_graph;
 	int ret = 0;
 
-	if (ar_graph->start_count == 0)
+	mutex_lock(&ar_graph->state_lock);
+	if (ar_graph->flush_pending)
+		ret = -EBUSY;
+	else if (ar_graph->start_count == 0)
 		ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_START);
 
-	ar_graph->start_count++;
+	if (!ret)
+		ar_graph->start_count++;
+	mutex_unlock(&ar_graph->state_lock);
 
 	return ret;
 }
 EXPORT_SYMBOL_GPL(q6apm_graph_start);
 
-int q6apm_graph_stop(struct q6apm_graph *graph)
+static int __q6apm_graph_stop(struct q6apm_graph *graph, bool request_flush,
+			      bool *last)
 {
 	struct audioreach_graph *ar_graph = graph->ar_graph;
+	int ret = 0;
 
-	if (--ar_graph->start_count > 0)
-		return 0;
+	if (last)
+		*last = false;
 
-	return audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_STOP);
+	mutex_lock(&ar_graph->state_lock);
+	if (ar_graph->start_count <= 0) {
+		if (request_flush && ar_graph->flush_pending && last)
+			*last = true;
+		else
+			ret = -EINVAL;
+		goto unlock;
+	}
+
+	if (ar_graph->start_count > 1) {
+		ar_graph->start_count--;
+		goto unlock;
+	}
+
+	ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_STOP);
+	if (!ret) {
+		ar_graph->start_count = 0;
+		ar_graph->flush_pending = request_flush;
+		if (last)
+			*last = true;
+	}
+
+unlock:
+	mutex_unlock(&ar_graph->state_lock);
+	return ret;
+}
+
+int q6apm_graph_stop_with_state(struct q6apm_graph *graph, bool *last)
+{
+	return __q6apm_graph_stop(graph, true, last);
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_stop_with_state);
+
+int q6apm_graph_stop(struct q6apm_graph *graph)
+{
+	return __q6apm_graph_stop(graph, false, NULL);
 }
 EXPORT_SYMBOL_GPL(q6apm_graph_stop);
 
+bool q6apm_graph_request_flush(struct q6apm_graph *graph)
+{
+	struct audioreach_graph *ar_graph = graph->ar_graph;
+	bool ready = false;
+
+	mutex_lock(&ar_graph->state_lock);
+	if (!ar_graph->start_count) {
+		ar_graph->flush_pending = true;
+		ready = true;
+	}
+	mutex_unlock(&ar_graph->state_lock);
+
+	return ready;
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_request_flush);
+
+static void __q6apm_graph_reset_client(struct q6apm_graph *graph)
+{
+	q6apm_reset_graph_data(&graph->rx_data);
+	q6apm_reset_graph_data(&graph->tx_data);
+	graph->pending_eos_token = 0;
+	graph->eos_pending = false;
+	graph->flushing = false;
+	wake_up_all(&graph->data_wait);
+}
+
+void q6apm_graph_reset_client(struct q6apm_graph *graph)
+{
+	mutex_lock(&graph->callback_lock);
+	mutex_lock(&graph->lock);
+	__q6apm_graph_reset_client(graph);
+	mutex_unlock(&graph->lock);
+	mutex_unlock(&graph->callback_lock);
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_reset_client);
+
+void q6apm_graph_quiesce_callbacks(struct q6apm_graph *graph)
+{
+	mutex_lock(&graph->callback_lock);
+	mutex_unlock(&graph->callback_lock);
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_quiesce_callbacks);
+
+bool q6apm_graph_try_reset_client(struct q6apm_graph *graph)
+{
+	bool reset = false;
+
+	mutex_lock(&graph->callback_lock);
+	mutex_lock(&graph->lock);
+	if (q6apm_graph_client_idle_locked(graph)) {
+		__q6apm_graph_reset_client(graph);
+		reset = true;
+	}
+	mutex_unlock(&graph->lock);
+	mutex_unlock(&graph->callback_lock);
+
+	return reset;
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_try_reset_client);
+
+static bool q6apm_graph_client_idle(struct q6apm_graph *graph)
+{
+	bool idle;
+
+	mutex_lock(&graph->lock);
+	idle = q6apm_graph_client_idle_locked(graph);
+	mutex_unlock(&graph->lock);
+
+	return idle;
+}
+
+int q6apm_graph_wait_for_client_idle(struct q6apm_graph *graph,
+				     unsigned long timeout)
+{
+	if (!wait_event_timeout(graph->data_wait,
+				q6apm_graph_client_idle(graph), timeout))
+		return -ETIMEDOUT;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_wait_for_client_idle);
+
+bool q6apm_graph_sync_flush_generation(struct q6apm_graph *graph)
+{
+	struct audioreach_graph *ar_graph = graph->ar_graph;
+	bool changed = false;
+
+	mutex_lock(&ar_graph->state_lock);
+	if (graph->flush_generation != ar_graph->flush_generation) {
+		mutex_lock(&graph->callback_lock);
+		mutex_lock(&graph->lock);
+		__q6apm_graph_reset_client(graph);
+		graph->flush_generation = ar_graph->flush_generation;
+		mutex_unlock(&graph->lock);
+		mutex_unlock(&graph->callback_lock);
+		changed = true;
+	}
+	mutex_unlock(&ar_graph->state_lock);
+
+	return changed;
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_sync_flush_generation);
+
 int q6apm_graph_flush(struct q6apm_graph *graph)
 {
-	return audioreach_graph_mgmt_cmd(graph->ar_graph, APM_CMD_GRAPH_FLUSH);
+	struct audioreach_graph *ar_graph = graph->ar_graph;
+	int ret;
+
+	mutex_lock(&ar_graph->state_lock);
+	if (ar_graph->start_count) {
+		mutex_unlock(&ar_graph->state_lock);
+		return -EINVAL;
+	}
+	if (!ar_graph->flush_pending) {
+		mutex_unlock(&ar_graph->state_lock);
+		return 0;
+	}
+
+	mutex_lock(&graph->lock);
+	if (graph->flushing) {
+		mutex_unlock(&graph->lock);
+		mutex_unlock(&ar_graph->state_lock);
+		return -EBUSY;
+	}
+	graph->flushing = true;
+	mutex_unlock(&graph->lock);
+
+	ret = audioreach_graph_mgmt_cmd(graph->ar_graph, APM_CMD_GRAPH_FLUSH);
+	if (ret) {
+		mutex_lock(&graph->lock);
+		graph->flushing = false;
+		mutex_unlock(&graph->lock);
+		mutex_unlock(&ar_graph->state_lock);
+		return ret;
+	}
+	ar_graph->flush_pending = false;
+	ar_graph->flush_generation++;
+	mutex_lock(&graph->callback_lock);
+	mutex_lock(&graph->lock);
+	__q6apm_graph_reset_client(graph);
+	graph->flush_generation = ar_graph->flush_generation;
+	mutex_unlock(&graph->lock);
+	mutex_unlock(&graph->callback_lock);
+	mutex_unlock(&ar_graph->state_lock);
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(q6apm_graph_flush);
 
@@ -724,8 +1370,15 @@ static int q6apm_audio_probe(struct snd_soc_component *component)
 
 static void q6apm_audio_remove(struct snd_soc_component *component)
 {
+	struct q6apm *apm = dev_get_drvdata(component->dev);
+
 	/* remove topology */
 	snd_soc_tplg_component_remove(component);
+
+	down_write(&apm->graph_lock);
+	apm->topology_remove_complete = true;
+	audioreach_tplg_free_deferred(apm);
+	up_write(&apm->graph_lock);
 }
 
 #define APM_AUDIO_DRV_NAME "q6apm-audio"
@@ -743,15 +1396,24 @@ static int apm_probe(gpr_device_t *gdev)
 	struct q6apm *apm;
 	int ret;
 
-	apm = devm_kzalloc(dev, sizeof(*apm), GFP_KERNEL);
+	apm = kzalloc_obj(*apm);
 	if (!apm)
 		return -ENOMEM;
 
+	kref_init(&apm->refcount);
 	dev_set_drvdata(dev, apm);
 
 	mutex_init(&apm->lock);
+	mutex_init(&apm->online_lock);
+	mutex_init(&apm->cmd_lock);
+	mutex_init(&apm->response_lock);
+	init_rwsem(&apm->graph_lock);
+	init_waitqueue_head(&apm->graph_wait);
+	atomic_set(&apm->active_graphs, 0);
+	atomic_set(&apm->graph_generation, 0);
 	apm->dev = dev;
 	apm->gdev = gdev;
+	apm->online = true;
 	init_waitqueue_head(&apm->wait);
 
 	INIT_LIST_HEAD(&apm->widget_list);
@@ -762,27 +1424,54 @@ static int apm_probe(gpr_device_t *gdev)
 
 	idr_init(&apm->modules_idr);
 
+	mutex_lock(&g_apm_lock);
 	g_apm = apm;
-
-	q6apm_get_apm_state(apm);
+	mutex_unlock(&g_apm_lock);
 
 	ret = snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
 	if (ret < 0) {
 		dev_err(dev, "failed to register q6apm: %d\n", ret);
-		return ret;
+		goto mark_offline;
 	}
 
 	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
-	if (ret)
+	if (ret) {
+		of_platform_depopulate(dev);
 		snd_soc_unregister_component(dev);
+		goto mark_offline;
+	}
 
+	return 0;
+
+mark_offline:
+	mutex_lock(&g_apm_lock);
+	if (g_apm == apm)
+		g_apm = NULL;
+	mutex_lock(&apm->online_lock);
+	WRITE_ONCE(apm->online, false);
+	mutex_unlock(&apm->online_lock);
+	mutex_unlock(&g_apm_lock);
+	dev_set_drvdata(dev, NULL);
+	kref_put(&apm->refcount, q6apm_release);
 	return ret;
 }
 
 static void apm_remove(gpr_device_t *gdev)
 {
+	struct q6apm *apm = dev_get_drvdata(&gdev->dev);
+
+	mutex_lock(&g_apm_lock);
+	if (g_apm == apm)
+		g_apm = NULL;
+	mutex_lock(&apm->online_lock);
+	WRITE_ONCE(apm->online, false);
+	mutex_unlock(&apm->online_lock);
+	mutex_unlock(&g_apm_lock);
+
 	of_platform_depopulate(&gdev->dev);
 	snd_soc_unregister_component(&gdev->dev);
+	dev_set_drvdata(&gdev->dev, NULL);
+	kref_put(&apm->refcount, q6apm_release);
 }
 
 struct audioreach_module *q6apm_find_module_by_mid(struct q6apm_graph *graph, uint32_t mid)
@@ -803,18 +1492,59 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 	struct device *dev = &gdev->dev;
 	struct gpr_ibasic_rsp_result_t *result;
 	const struct gpr_hdr *hdr = &data->hdr;
+	uint32_t expected_opcode;
+	uint32_t graph_id;
+	bool matches;
+
+	if (!apm)
+		return 0;
 
 	result = data->payload;
+	mutex_lock(&apm->response_lock);
+	matches = apm->response_pending && hdr->token == apm->pending_token;
+	expected_opcode = apm->pending_opcode;
+	graph_id = apm->pending_graph_id;
+	if (!matches) {
+		mutex_unlock(&apm->response_lock);
+		dev_dbg(dev, "ignoring stale APM response 0x%08x token %u\n",
+			hdr->opcode, hdr->token);
+		return 0;
+	}
 
 	switch (hdr->opcode) {
 	case APM_CMD_RSP_GET_SPF_STATE:
 		apm->result.opcode = hdr->opcode;
-		apm->result.status = 0;
+		apm->result.status =
+			expected_opcode != APM_CMD_GET_SPF_STATE ||
+			data->payload_size < sizeof(result->opcode);
+		if (apm->result.status) {
+			dev_err(dev, "short APM state response: %d bytes\n",
+				data->payload_size);
+			wake_up(&apm->wait);
+			break;
+		}
 		/* First word of result it state */
 		apm->state = result->opcode;
 		wake_up(&apm->wait);
 		break;
 	case GPR_BASIC_RSP_RESULT:
+		if (data->payload_size < sizeof(*result)) {
+			dev_err(dev, "short APM basic response: %d bytes\n",
+				data->payload_size);
+			apm->result.opcode = expected_opcode;
+			apm->result.status = 1;
+			wake_up(&apm->wait);
+			break;
+		}
+		if (result->opcode != expected_opcode) {
+			dev_err(dev,
+				"APM response opcode mismatch: expected 0x%08x got 0x%08x\n",
+				expected_opcode, result->opcode);
+			apm->result.opcode = expected_opcode;
+			apm->result.status = 1;
+			wake_up(&apm->wait);
+			break;
+		}
 		switch (result->opcode) {
 		case APM_CMD_SHARED_MEM_MAP_REGIONS:
 		case APM_CMD_GRAPH_START:
@@ -832,16 +1562,22 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 			wake_up(&apm->wait);
 			break;
 		case APM_CMD_SHARED_MEM_UNMAP_REGIONS:
-			apm->result.opcode = hdr->opcode;
-			apm->result.status = 0;
-			rsp = data->payload;
+			apm->result.opcode = result->opcode;
+			apm->result.status = result->status;
 
-			info = idr_find(&apm->graph_info_idr, hdr->token);
-			if (info)
+			mutex_lock(&apm->lock);
+			info = idr_find(&apm->graph_info_idr, graph_id);
+			if (info && !result->status) {
 				info->mem_map_handle = 0;
-			else
+			} else if (!info) {
+				apm->result.status = 1;
 				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n", result->status,
 					result->opcode);
+			}
+			mutex_unlock(&apm->lock);
+			if (result->status)
+				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n",
+					result->status, result->opcode);
 
 			wake_up(&apm->wait);
 			break;
@@ -851,15 +1587,27 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 		break;
 	case APM_CMD_RSP_SHARED_MEM_MAP_REGIONS:
 		apm->result.opcode = hdr->opcode;
-		apm->result.status = 0;
+		apm->result.status =
+			expected_opcode != APM_CMD_SHARED_MEM_MAP_REGIONS ||
+			data->payload_size < sizeof(*rsp);
+		if (apm->result.status) {
+			dev_err(dev, "short APM map response: %d bytes\n",
+				data->payload_size);
+			wake_up(&apm->wait);
+			break;
+		}
 		rsp = data->payload;
 
-		info = idr_find(&apm->graph_info_idr, hdr->token);
-		if (info)
+		mutex_lock(&apm->lock);
+		info = idr_find(&apm->graph_info_idr, graph_id);
+		if (info && rsp->mem_map_handle) {
 			info->mem_map_handle = rsp->mem_map_handle;
-		else
-			dev_err(dev, "Error (%d) Processing 0x%08x cmd\n", result->status,
-				result->opcode);
+		} else {
+			apm->result.status = 1;
+			dev_err(dev, "invalid map response for graph %u\n",
+				graph_id);
+		}
+		mutex_unlock(&apm->lock);
 
 		wake_up(&apm->wait);
 		break;
@@ -867,6 +1615,7 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 		break;
 	}
 
+	mutex_unlock(&apm->response_lock);
 	return 0;
 }
 

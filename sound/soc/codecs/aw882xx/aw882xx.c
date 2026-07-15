@@ -44,7 +44,7 @@
 #define AW_READ_CHIPID_RETRIES		5	/* 5 times */
 #define AW_READ_CHIPID_RETRY_DELAY	5	/* 5 ms */
 
-static unsigned int g_aw882xx_dev_cnt;
+static atomic_t g_aw882xx_dev_cnt = ATOMIC_INIT(0);
 static unsigned int g_print_dbg;
 static unsigned int g_algo_rx_en = true;
 static unsigned int g_algo_tx_en = true;
@@ -52,7 +52,6 @@ static unsigned int g_algo_copp_en = true;
 static unsigned int g_iv_output = false;
 
 //one_rst
-static unsigned int one_rst_request[4] = {0};
 static unsigned int one_rst_dts[4] = {0};
 static unsigned int one_rst_hw[4] = {0};
 
@@ -129,7 +128,29 @@ int aw882xx_get_version(char *buf, int size)
 
 int aw882xx_get_dev_num(void)
 {
-	return g_aw882xx_dev_cnt;
+	return atomic_read(&g_aw882xx_dev_cnt);
+}
+
+static void aw882xx_dev_count_get(void)
+{
+	mutex_lock(&g_aw882xx_lock);
+	atomic_inc(&g_aw882xx_dev_cnt);
+	mutex_unlock(&g_aw882xx_lock);
+}
+
+static void aw882xx_dev_count_put(void)
+{
+	mutex_lock(&g_aw882xx_lock);
+	if (WARN_ON(atomic_read(&g_aw882xx_dev_cnt) <= 0)) {
+		mutex_unlock(&g_aw882xx_lock);
+		return;
+	}
+
+	if (atomic_dec_and_test(&g_aw882xx_dev_cnt)) {
+		vfree(g_awinic_cfg);
+		g_awinic_cfg = NULL;
+	}
+	mutex_unlock(&g_aw882xx_lock);
 }
 
 static int aw882xx_i2c_writes(struct aw882xx *aw882xx,
@@ -417,7 +438,7 @@ static int aw882xx_mute(struct snd_soc_dai *dai, int mute, int stream)
 		cancel_delayed_work_sync(&aw882xx->dc_work);
 		cancel_delayed_work_sync(&aw882xx->start_work);
 		mutex_lock(&aw882xx->lock);
-		g_algo_auth_st = AW_ALGO_AUTH_WAIT;
+		aw882xx_dev_algo_auth_reset();
 		aw882xx_device_stop(aw882xx->aw_pa);
 		mutex_unlock(&aw882xx->lock);
 	} else {
@@ -827,12 +848,7 @@ static int aw882xx_algo_auth_tlv_rw(struct snd_kcontrol *kcontrol, int op_flag,
 	case SNDRV_CTL_TLV_OP_READ:
 		aw_dev_dbg(aw882xx->dev, "get algo auth data");
 		memset(&algo_data, 0x0, sizeof(struct algo_auth_data));
-
-		algo_data.auth_mode = aw_pa->auth_desc.auth_mode;
-		algo_data.chip_id = aw_pa->auth_desc.chip_id;
-		algo_data.random = aw_pa->auth_desc.random;
-		algo_data.reg_crc = aw_pa->auth_desc.reg_crc;
-		algo_data.check_result = aw_pa->auth_desc.check_result;
+		aw882xx_dev_get_algo_auth_data(aw_pa, &algo_data);
 
 		if (copy_to_user((void __user *)tlv, (char *)&algo_data, size))
 			ret = -EFAULT;
@@ -840,9 +856,9 @@ static int aw882xx_algo_auth_tlv_rw(struct snd_kcontrol *kcontrol, int op_flag,
 	case SNDRV_CTL_TLV_OP_WRITE:
 		aw_dev_dbg(aw882xx->dev, "set algo auth data");
 		if (copy_from_user(&algo_data, (void __user *)tlv, size))
-			ret = -EFAULT;
+			return -EFAULT;
 
-		aw882xx_dev_algo_auth_mode(aw_pa, &algo_data);
+		ret = aw882xx_dev_algo_auth_mode(aw_pa, &algo_data);
 		break;
 	default:
 		aw_dev_dbg(aw882xx->dev, "unsupport op flag[0x%x]", op_flag);
@@ -1074,10 +1090,15 @@ static void aw882xx_request_firmware(struct work_struct *work)
 
 	aw_dev_info(aw882xx->dev, "load [%s] , file size: [%zu]",
 			ACF_BIN_NAME, cont ? cont->size : 0);
+	if (cont->size > UINT_MAX || cont->size > SIZE_MAX - sizeof(*aw_cfg)) {
+		aw_dev_err(aw882xx->dev, "firmware is too large: %zu", cont->size);
+		release_firmware(cont);
+		return;
+	}
 
 	mutex_lock(&g_aw882xx_lock);
 	if (g_awinic_cfg == NULL) {
-		aw_cfg = vzalloc(cont->size + sizeof(int));
+		aw_cfg = vzalloc(sizeof(*aw_cfg) + cont->size);
 		if (aw_cfg == NULL) {
 			release_firmware(cont);
 			aw_dev_err(aw882xx->dev, "malloc failed");
@@ -1247,7 +1268,6 @@ static int aw882xx_set_rx_en(struct snd_kcontrol *kcontrol,
 {
 	int ret = -EINVAL;
 	uint32_t ctrl_value = 0;
-	struct aw_device *aw_dev = NULL;
 	aw_snd_soc_codec_t *codec =
 		aw_componet_codec_ops.kcontrol_codec(kcontrol);
 	struct aw882xx *aw882xx =
@@ -1256,7 +1276,6 @@ static int aw882xx_set_rx_en(struct snd_kcontrol *kcontrol,
 	aw_dev_dbg(aw882xx->dev, "ucontrol->value.integer.value[0]=%ld",
 				ucontrol->value.integer.value[0]);
 
-	aw_dev = aw882xx->aw_pa;
 	ctrl_value = ucontrol->value.integer.value[0];
 
 	if (aw882xx->pstream) {
@@ -1277,14 +1296,11 @@ static int aw882xx_get_rx_en(struct snd_kcontrol *kcontrol,
 {
 	int ret = -EINVAL;
 	uint32_t ctrl_value = 0;
-	struct aw_device *aw_dev = NULL;
 
 	aw_snd_soc_codec_t *codec =
 		aw_componet_codec_ops.kcontrol_codec(kcontrol);
 	struct aw882xx *aw882xx =
 		aw_componet_codec_ops.codec_get_drvdata(codec);
-
-	aw_dev = aw882xx->aw_pa;
 
 	if (aw882xx->pstream) {
 		ret = aw882xx_dev_get_afe_module_en(AW_RX_MODULE, &ctrl_value);
@@ -1307,7 +1323,6 @@ static int aw882xx_set_tx_en(struct snd_kcontrol *kcontrol,
 {
 	int ret = -EINVAL;
 	uint32_t ctrl_value = 0;
-	struct aw_device *aw_dev = NULL;
 	aw_snd_soc_codec_t *codec =
 		aw_componet_codec_ops.kcontrol_codec(kcontrol);
 	struct aw882xx *aw882xx =
@@ -1316,7 +1331,6 @@ static int aw882xx_set_tx_en(struct snd_kcontrol *kcontrol,
 	aw_dev_dbg(aw882xx->dev, "ucontrol->value.integer.value[0]=%ld",
 			ucontrol->value.integer.value[0]);
 
-	aw_dev = aw882xx->aw_pa;
 	ctrl_value = ucontrol->value.integer.value[0];
 
 	if (aw882xx->pstream) {
@@ -1337,14 +1351,11 @@ static int aw882xx_get_tx_en(struct snd_kcontrol *kcontrol,
 {
 	int ret = -EINVAL;
 	uint32_t ctrl_value = 0;
-	struct aw_device *aw_dev = NULL;
 
 	aw_snd_soc_codec_t *codec =
 		aw_componet_codec_ops.kcontrol_codec(kcontrol);
 	struct aw882xx *aw882xx =
 		aw_componet_codec_ops.codec_get_drvdata(codec);
-	aw_dev = aw882xx->aw_pa;
-
 	if (aw882xx->pstream) {
 		ret = aw882xx_dev_get_afe_module_en(AW_TX_MODULE, &ctrl_value);
 		if (ret) {
@@ -1367,7 +1378,6 @@ static int aw882xx_set_copp_en(struct snd_kcontrol *kcontrol,
 {
 	int ret = -EINVAL;
 	uint32_t ctrl_value = 0;
-	struct aw_device *aw_dev = NULL;
 	aw_snd_soc_codec_t *codec =
 		aw_componet_codec_ops.kcontrol_codec(kcontrol);
 	struct aw882xx *aw882xx =
@@ -1376,7 +1386,6 @@ static int aw882xx_set_copp_en(struct snd_kcontrol *kcontrol,
 	aw_dev_dbg(aw882xx->dev, "ucontrol->value.integer.value[0]=%ld",
 			ucontrol->value.integer.value[0]);
 
-	aw_dev = aw882xx->aw_pa;
 	ctrl_value = ucontrol->value.integer.value[0];
 
 	if (aw882xx->pstream) {
@@ -1839,15 +1848,26 @@ static int aw882xx_codec_probe(aw_snd_soc_codec_t *aw_codec)
 	return 0;
 }
 
+static void aw882xx_codec_cleanup(struct aw882xx *aw882xx)
+{
+	if (aw882xx->work_queue) {
+		cancel_delayed_work_sync(&aw882xx->fw_work);
+		cancel_delayed_work_sync(&aw882xx->start_work);
+		cancel_delayed_work_sync(&aw882xx->dc_work);
+		cancel_delayed_work_sync(&aw882xx->interrupt_work);
+		destroy_workqueue(aw882xx->work_queue);
+		aw882xx->work_queue = NULL;
+	}
+	aw882xx_dev_deinit(aw882xx->aw_pa);
+}
+
 #ifdef AW_KERNEL_VER_OVER_4_19_1
 static void aw882xx_codec_remove(aw_snd_soc_codec_t *aw_codec)
 {
 	struct aw882xx *aw882xx =
 		aw_componet_codec_ops.codec_get_drvdata(aw_codec);
 	aw_dev_info(aw882xx->dev, "enter");
-	aw882xx_dev_deinit(aw882xx->aw_pa);
-	destroy_workqueue(aw882xx->work_queue);
-	aw882xx->work_queue = NULL;
+	aw882xx_codec_cleanup(aw882xx);
 }
 #else
 static int aw882xx_codec_remove(aw_snd_soc_codec_t *aw_codec)
@@ -1856,9 +1876,7 @@ static int aw882xx_codec_remove(aw_snd_soc_codec_t *aw_codec)
 		aw_componet_codec_ops.codec_get_drvdata(aw_codec);
 
 	aw_dev_info(aw882xx->dev, "enter");
-	aw882xx_dev_deinit(aw882xx->aw_pa);
-	destroy_workqueue(aw882xx->work_queue);
-	aw882xx->work_queue = NULL;
+	aw882xx_codec_cleanup(aw882xx);
 	return 0;
 }
 #endif
@@ -2253,14 +2271,24 @@ static int aw882xx_interrupt_init(struct aw882xx *aw882xx)
 		if (ret != 0) {
 			aw_dev_err(aw882xx->dev, "Failed to request IRQ %d: %d",
 					gpiod_to_irq(aw882xx->irq_gpio), ret);
-			return ret;
-		}
+				return ret;
+			}
+		aw882xx->irq_requested = true;
 	} else {
 		aw_dev_info(aw882xx->dev, "gpio invalid");
 		/* disable interrupt */
 	}
 
 	return 0;
+}
+
+static void aw882xx_interrupt_deinit(struct aw882xx *aw882xx)
+{
+	if (!aw882xx->irq_requested)
+		return;
+
+	devm_free_irq(aw882xx->dev, gpiod_to_irq(aw882xx->irq_gpio), aw882xx);
+	aw882xx->irq_requested = false;
 }
 
 static ssize_t reg_store(struct device *dev,
@@ -2798,15 +2826,18 @@ static int aw882xx_i2c_probe(struct i2c_client *i2c)
 	ret = aw882xx_init(aw882xx);
 	if (ret)
 		return ret;
+	aw882xx_dev_count_get();
 
 	/*aw882xx irq*/
-	aw882xx_interrupt_init(aw882xx);
+	ret = aw882xx_interrupt_init(aw882xx);
+	if (ret)
+		goto err_device;
 
 	/*codec register*/
 	ret = aw_componet_codec_register(aw882xx);
 	if (ret) {
 		aw_dev_err(&i2c->dev, "codec register failde");
-		return ret;
+		goto err_irq;
 	}
 
 	/*create attr*/
@@ -2825,15 +2856,19 @@ static int aw882xx_i2c_probe(struct i2c_client *i2c)
 	aw882xx->i2c_packet.reg_addr = 0xff;
 	aw882xx->i2c_packet.reg_data = NULL;
 
-	/*add device to total list*/
-	mutex_lock(&g_aw882xx_lock);
-	g_aw882xx_dev_cnt++;
-	mutex_unlock(&g_aw882xx_lock);
-	aw_dev_info(&i2c->dev, "dev_cnt %d", g_aw882xx_dev_cnt);
+	aw_dev_info(&i2c->dev, "dev_cnt %d", atomic_read(&g_aw882xx_dev_cnt));
 	return ret;
 err_sysfs:
+	aw882xx_interrupt_deinit(aw882xx);
+	aw882xx_device_unpublish(aw882xx->aw_pa);
 	aw_componet_codec_ops.unregister_codec(&i2c->dev);
-
+	goto err_device;
+err_irq:
+	aw882xx_interrupt_deinit(aw882xx);
+	aw882xx_device_unpublish(aw882xx->aw_pa);
+err_device:
+	aw882xx_device_remove(aw882xx->aw_pa);
+	aw882xx_dev_count_put();
 	return ret;
 }
 
@@ -2847,31 +2882,21 @@ static int aw882xx_i2c_remove(struct i2c_client *i2c)
 
 	aw_dev_info(aw882xx->dev, "enter");
 
-	/*rm irq*/
-	if (aw882xx->irq_gpio)
-		devm_free_irq(&i2c->dev,
-			gpiod_to_irq(aw882xx->irq_gpio),
-			aw882xx);
+	/* stop IRQ callbacks before tearing down the component workqueue */
+	aw882xx_interrupt_deinit(aw882xx);
 
 	/*rm attr node*/
 	sysfs_remove_group(&i2c->dev.kobj, &aw882xx_attribute_group);
 
-	/*free device resource */
-	aw882xx_device_remove(aw882xx->aw_pa);
+	/* prevent new misc/class users before component state is released */
+	aw882xx_device_unpublish(aw882xx->aw_pa);
 
 	/*unregister codec*/
 	aw882xx->codec_ops->unregister_codec(&i2c->dev);
 
-	/*remove device to total list*/
-	mutex_lock(&g_aw882xx_lock);
-	g_aw882xx_dev_cnt--;
-	if (g_aw882xx_dev_cnt == 0) {
-		if (g_awinic_cfg) {
-			vfree(g_awinic_cfg);
-			g_awinic_cfg = NULL;
-		}
-	}
-	mutex_unlock(&g_aw882xx_lock);
+	/*free device resource */
+	aw882xx_device_remove(aw882xx->aw_pa);
+	aw882xx_dev_count_put();
 
 #ifdef AW_KERNEL_VER_OVER_6_1_0
 #else

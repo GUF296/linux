@@ -38,16 +38,24 @@ static int nt36523_dcs_write_buf(struct mipi_dsi_device *dsi,
 #define mipi_dsi_dcs_write_seq(dsi, seq...)			\
 	do {							\
 		static const u8 d[] = { seq };			\
+		int __ret;					\
 								\
-		nt36523_dcs_write_buf(dsi, d, ARRAY_SIZE(d));	\
+		__ret = nt36523_dcs_write_buf(dsi, d, ARRAY_SIZE(d)); \
+		if (__ret < 0)					\
+			return __ret;				\
 	} while (0)
 
 #define mipi_dsi_dual_dcs_write_seq(dsi0, dsi1, seq...)		\
 	do {								\
 		static const u8 d[] = { seq };				\
+		int __ret;						\
 									\
-		nt36523_dcs_write_buf(dsi0, d, ARRAY_SIZE(d));		\
-		nt36523_dcs_write_buf(dsi1, d, ARRAY_SIZE(d));		\
+		__ret = nt36523_dcs_write_buf(dsi0, d, ARRAY_SIZE(d)); \
+		if (__ret < 0)						\
+			return __ret;					\
+		__ret = nt36523_dcs_write_buf(dsi1, d, ARRAY_SIZE(d)); \
+		if (__ret < 0)						\
+			return __ret;					\
 	} while (0)
 
 struct panel_info {
@@ -1439,15 +1447,29 @@ static int nt36523_enable_dsc(struct panel_info *pinfo)
 
 	for (i = 0; i < DSI_NUM_MIN + pinfo->desc->is_dual_dsi; i++) {
 		ret = mipi_dsi_compression_mode(pinfo->dsi[i], true);
-		if (ret < 0)
-			return dev_err_probe(dev, ret,
-					     "failed to enable DSC on DSI%d\n",
-					     i);
+		if (ret < 0) {
+			ret = dev_err_probe(dev, ret,
+					    "failed to enable DSC on DSI%d\n", i);
+			goto disable_compression;
+		}
 	}
 
 	msleep(28);
 
 	return 0;
+
+disable_compression:
+	while (--i >= 0) {
+		int disable_ret;
+
+		disable_ret = mipi_dsi_compression_mode(pinfo->dsi[i], false);
+		if (disable_ret < 0)
+			dev_warn(&pinfo->dsi[i]->dev,
+				 "failed to unwind DSC on DSI%d: %d\n",
+				 i, disable_ret);
+	}
+
+	return ret;
 }
 
 static void nt36523_reset(struct panel_info *pinfo)
@@ -1505,6 +1527,8 @@ disable_vddio:
 static int nt36523_prepare(struct drm_panel *panel)
 {
 	struct panel_info *pinfo = to_panel_info(panel);
+	bool dsc_enabled = false;
+	int i;
 	int ret;
 
 	ret = nt36523_power_on(pinfo);
@@ -1517,29 +1541,44 @@ static int nt36523_prepare(struct drm_panel *panel)
 
 	ret = pinfo->desc->init_sequence(pinfo);
 	if (ret < 0) {
-		nt36523_power_off(pinfo);
 		dev_err(panel->dev, "failed to initialize panel: %d\n", ret);
-		return ret;
+		goto power_off;
 	}
 
 	if (pinfo->desc->has_dsc) {
 		ret = nt36523_enable_dsc(pinfo);
-		if (ret < 0) {
-			nt36523_power_off(pinfo);
-			return ret;
-		}
+		if (ret < 0)
+			goto power_off;
+		dsc_enabled = true;
 	}
 
 	if (pinfo->desc->display_on_after_dsc) {
 		ret = kirby_csot_display_on_sequence(pinfo);
 		if (ret < 0) {
-			nt36523_power_off(pinfo);
 			dev_err(panel->dev, "failed to set display on: %d\n", ret);
-			return ret;
+			goto power_off;
 		}
 	}
 
 	return 0;
+
+power_off:
+	if (dsc_enabled) {
+		for (i = DSI_NUM_MIN + pinfo->desc->is_dual_dsi - 1;
+		     i >= 0; i--) {
+			int disable_ret;
+
+			disable_ret = mipi_dsi_compression_mode(pinfo->dsi[i],
+								false);
+			if (disable_ret < 0)
+				dev_warn(&pinfo->dsi[i]->dev,
+					 "failed to unwind DSC on DSI%d: %d\n",
+					 i, disable_ret);
+		}
+	}
+	gpiod_set_value_cansleep(pinfo->reset_gpio, 1);
+	nt36523_power_off(pinfo);
+	return ret;
 }
 
 static int nt36523_disable(struct drm_panel *panel)
@@ -1577,20 +1616,19 @@ static int nt36523_unprepare(struct drm_panel *panel)
 static void nt36523_remove(struct mipi_dsi_device *dsi)
 {
 	struct panel_info *pinfo = mipi_dsi_get_drvdata(dsi);
-	int ret;
+	int i, ret;
 
-	ret = mipi_dsi_detach(pinfo->dsi[0]);
-	if (ret < 0)
-		dev_err(&dsi->dev, "failed to detach from DSI0 host: %d\n", ret);
-
-	if (pinfo->desc->is_dual_dsi) {
-		ret = mipi_dsi_detach(pinfo->dsi[1]);
+	for (i = DSI_NUM_MIN + pinfo->desc->is_dual_dsi - 1; i >= 0; i--) {
+		ret = mipi_dsi_detach(pinfo->dsi[i]);
 		if (ret < 0)
-			dev_err(&pinfo->dsi[1]->dev, "failed to detach from DSI1 host: %d\n", ret);
-		mipi_dsi_device_unregister(pinfo->dsi[1]);
+			dev_err(&pinfo->dsi[i]->dev,
+				"failed to detach from DSI%d host: %d\n", i, ret);
 	}
 
 	drm_panel_remove(&pinfo->panel);
+
+	if (pinfo->desc->is_dual_dsi)
+		mipi_dsi_device_unregister(pinfo->dsi[1]);
 }
 
 static int nt36523_get_modes(struct drm_panel *panel,
@@ -1774,20 +1812,24 @@ static int nt36523_probe(struct mipi_dsi_device *dsi)
 	ret = of_drm_get_panel_orientation(dev->of_node, &pinfo->orientation);
 	if (ret < 0) {
 		dev_err(dev, "%pOF: failed to get orientation %d\n", dev->of_node, ret);
-		return ret;
+		goto unregister_dsi1;
 	}
 
 	pinfo->panel.prepare_prev_first = true;
 
 	if (pinfo->desc->has_dcs_backlight) {
 		pinfo->panel.backlight = nt36523_create_backlight(dsi);
-		if (IS_ERR(pinfo->panel.backlight))
-			return dev_err_probe(dev, PTR_ERR(pinfo->panel.backlight),
-					     "Failed to create backlight\n");
+		if (IS_ERR(pinfo->panel.backlight)) {
+			ret = dev_err_probe(dev, PTR_ERR(pinfo->panel.backlight),
+					    "Failed to create backlight\n");
+			goto unregister_dsi1;
+		}
 	} else {
 		ret = drm_panel_of_backlight(&pinfo->panel);
-		if (ret)
-			return dev_err_probe(dev, ret, "Failed to get backlight\n");
+		if (ret) {
+			ret = dev_err_probe(dev, ret, "Failed to get backlight\n");
+			goto unregister_dsi1;
+		}
 	}
 
 	drm_panel_add(&pinfo->panel);
@@ -1802,11 +1844,30 @@ static int nt36523_probe(struct mipi_dsi_device *dsi)
 		}
 
 		ret = mipi_dsi_attach(pinfo->dsi[i]);
-		if (ret < 0)
-			return dev_err_probe(dev, ret, "cannot attach to DSI%d host.\n", i);
+		if (ret < 0) {
+			ret = dev_err_probe(dev, ret, "cannot attach to DSI%d host.\n", i);
+			goto detach_dsi;
+		}
 	}
 
 	return 0;
+
+detach_dsi:
+	while (--i >= 0) {
+		int detach_ret;
+
+		detach_ret = mipi_dsi_detach(pinfo->dsi[i]);
+		if (detach_ret < 0)
+			dev_err(&pinfo->dsi[i]->dev,
+				"failed to unwind DSI%d attachment: %d\n",
+				i, detach_ret);
+	}
+	drm_panel_remove(&pinfo->panel);
+unregister_dsi1:
+	if (pinfo->desc->is_dual_dsi)
+		mipi_dsi_device_unregister(pinfo->dsi[1]);
+
+	return ret;
 }
 
 static const struct of_device_id nt36523_of_match[] = {

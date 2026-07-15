@@ -13,6 +13,10 @@
 
 #ifndef __AW882XX_DEVICE_FILE_H__
 #define __AW882XX_DEVICE_FILE_H__
+#include <linux/completion.h>
+#include <linux/mutex.h>
+#include <linux/refcount.h>
+
 #include "aw882xx_data_type.h"
 #include "aw882xx_calib.h"
 #include "aw882xx_monitor.h"
@@ -29,7 +33,6 @@
 #define AW_GET_MAX_VALUE(value1, value2)  \
 	((value1) > (value2) ? (value1) : (value2))
 
-extern int g_algo_auth_st;
 
 enum {
 	AW_1000_US = 1000,
@@ -413,8 +416,16 @@ struct aw_device {
 	struct aw_mpd_desc mpd_desc;
 	struct aw_dsmzth_desc dsmzth_desc;
 	struct aw_auth_desc auth_desc;
+	struct mutex auth_lock;
 	struct aw_device_ops ops;
 	struct list_head list_node;
+	refcount_t users;
+	struct completion users_done;
+};
+
+struct aw_device_list {
+	struct aw_device *devices[AW_DEV_CH_MAX];
+	unsigned int count;
 };
 
 
@@ -452,7 +463,13 @@ int aw882xx_dev_set_copp_module_en(bool enable);
 
 int aw882xx_device_probe(struct aw_device *aw_dev);
 int aw882xx_device_remove(struct aw_device *aw_dev);
-int aw882xx_dev_get_list_head(struct list_head **head);
+void aw882xx_device_unpublish(struct aw_device *aw_dev);
+void aw882xx_dev_algo_auth_reset(void);
+int aw882xx_dev_get_list(struct aw_device_list *dev_list);
+void aw882xx_dev_put_list(struct aw_device_list *dev_list);
+struct aw_device *aw882xx_dev_get_by_channel(unsigned int channel);
+struct aw_device *aw882xx_dev_get_first(void);
+void aw882xx_dev_put(struct aw_device *aw_dev);
 
 int aw882xx_dev_set_volume(struct aw_device *aw_dev, unsigned int set_vol);
 int aw882xx_dev_get_volume(struct aw_device *aw_dev, unsigned int *get_vol);
@@ -463,6 +480,8 @@ void aw882xx_dev_monitor_hal_get_time(struct aw_device *aw_dev, uint32_t *time);
 void aw882xx_dev_monitor_hal_work(struct aw_device *aw_dev, uint32_t *vmax);
 
 int aw882xx_dev_algo_auth_mode(struct aw_device *aw_dev, struct algo_auth_data *algo_data);
+void aw882xx_dev_get_algo_auth_data(struct aw_device *aw_dev,
+				    struct algo_auth_data *algo_data);
 void aw882xx_dev_iv_forbidden_output(struct aw_device *aw_dev, bool power_waste);
 
 #endif

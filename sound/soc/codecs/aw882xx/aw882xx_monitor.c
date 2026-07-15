@@ -68,6 +68,7 @@ static int aw_monitor_get_data_form_system(struct aw_device *aw_dev,
 	psy = power_supply_get_by_name(name);
 	if (psy) {
 		ret = power_supply_get_property(psy, data_type, &prop);
+		power_supply_put(psy);
 		if (ret < 0) {
 			aw_dev_err(aw_dev->dev, "get data failed");
 			return -EINVAL;
@@ -188,8 +189,8 @@ static int aw_monitor_first_get_data_form_table(struct aw_device *aw_dev,
 {
 	int i;
 
-	if (table_info.aw_table == NULL) {
-		aw_dev_err(aw_dev->dev, "table_info.aw_table is null");
+	if (!table_info.table_num || !table_info.aw_table) {
+		aw_dev_err(aw_dev->dev, "monitor table is empty");
 		return -EINVAL;
 	}
 
@@ -200,7 +201,7 @@ static int aw_monitor_first_get_data_form_table(struct aw_device *aw_dev,
 			break;
 		}
 	}
-	return 0;
+	return i == table_info.table_num ? -ERANGE : 0;
 }
 
 static int aw_monitor_trace_data_from_table(struct aw_device *aw_dev,
@@ -209,8 +210,8 @@ static int aw_monitor_trace_data_from_table(struct aw_device *aw_dev,
 {
 	int i;
 
-	if (table_info.aw_table == NULL) {
-		aw_dev_err(aw_dev->dev, "table_info.aw_table is null");
+	if (!table_info.table_num || !table_info.aw_table) {
+		aw_dev_err(aw_dev->dev, "monitor table is empty");
 		return -EINVAL;
 	}
 
@@ -223,7 +224,7 @@ static int aw_monitor_trace_data_from_table(struct aw_device *aw_dev,
 		}
 	}
 
-	return 0;
+	return i == table_info.table_num ? -ERANGE : 0;
 }
 
 static int aw_monitor_get_data_from_table(struct aw_device *aw_dev,
@@ -237,6 +238,8 @@ static int aw_monitor_get_data_from_table(struct aw_device *aw_dev,
 		return aw_monitor_first_get_data_form_table(aw_dev,
 						table_info, data_trace);
 	} else {
+		if (!monitor->samp_count)
+			return -EINVAL;
 		data_trace->sum_val = data_trace->sum_val / monitor->samp_count;
 		data_trace->sum_val = ((int32_t)aplha * data_trace->sum_val +
 			(1000 - (int32_t)aplha) * data_trace->pre_val) / 1000;
@@ -395,8 +398,6 @@ static void aw_monitor_set_vmax(struct aw_device *aw_dev,
 		return;
 	}
 
-	aw_dev->monitor_desc.pre_vmax = vmax;
-
 	if (aw_dev->monitor_desc.monitor_mode == AW_MON_KERNEL_MODE) {
 		ret = aw882xx_dsp_write_vmax(aw_dev, (char *)&vmax, sizeof(uint32_t));
 		if (ret)
@@ -404,6 +405,7 @@ static void aw_monitor_set_vmax(struct aw_device *aw_dev,
 
 		aw_dev_dbg(aw_dev->dev, "set vmax = 0x%x", vmax);
 	}
+	aw_dev->monitor_desc.pre_vmax = vmax;
 }
 
 static int aw_monitor_work(struct aw_device *aw_dev)
@@ -462,6 +464,8 @@ static void aw_monitor_work_func(struct work_struct *work)
 	struct aw_monitor_cfg *monitor_cfg = &aw_dev->monitor_desc.monitor_cfg;
 	struct aw_monitor_desc *monitor = &aw_dev->monitor_desc;
 
+	mutex_lock(&monitor->lock);
+
 	aw_dev_dbg(aw_dev->dev, "monitor_start:%d, monitor_status:%d, monitor_switch:%d",
 			aw_dev->monitor_start, monitor_cfg->monitor_status,
 			monitor_cfg->monitor_switch);
@@ -470,13 +474,15 @@ static void aw_monitor_work_func(struct work_struct *work)
 		monitor_cfg->monitor_switch) {
 		if (!aw_get_hmute(aw_dev)) {
 			aw_monitor_work(aw_dev);
-			if (monitor->monitor_mode == AW_MON_KERNEL_MODE) {
+			if (monitor->monitor_mode == AW_MON_KERNEL_MODE &&
+			    aw882xx && aw882xx->work_queue) {
 				queue_delayed_work(aw882xx->work_queue,
 					&monitor->delay_work,
 					msecs_to_jiffies(monitor_cfg->monitor_time));
 			}
 		}
 	}
+	mutex_unlock(&monitor->lock);
 }
 
 static void aw_monitor_check_bop_status(struct aw_device *aw_dev)
@@ -506,11 +512,11 @@ void aw882xx_monitor_start(struct aw_monitor_desc *monitor_desc)
 	struct aw882xx *aw882xx = (struct aw882xx *)aw_dev->private_data;
 
 	aw_dev_info(aw_dev->dev, "enter");
-
-	monitor_desc->first_entry = AW_FIRST_ENTRY;
-	monitor_desc->samp_count = 0;
-	monitor_desc->vol_trace.sum_val = 0;
-	monitor_desc->temp_trace.sum_val = 0;
+	if (monitor_desc->monitor_mode == AW_MON_KERNEL_MODE &&
+	    (!aw882xx || !aw882xx->work_queue)) {
+		aw_dev_err(aw_dev->dev, "monitor workqueue is unavailable");
+		return;
+	}
 
 	aw_monitor_check_bop_status(aw_dev);
 
@@ -519,11 +525,16 @@ void aw882xx_monitor_start(struct aw_monitor_desc *monitor_desc)
 		return;
 	}
 
+	mutex_lock(&monitor_desc->lock);
+	monitor_desc->first_entry = AW_FIRST_ENTRY;
+	monitor_desc->samp_count = 0;
+	monitor_desc->vol_trace.sum_val = 0;
+	monitor_desc->temp_trace.sum_val = 0;
 	monitor_desc->mon_start_flag = true;
-	if (monitor_desc->monitor_mode == AW_MON_KERNEL_MODE) {
+	mutex_unlock(&monitor_desc->lock);
+	if (monitor_desc->monitor_mode == AW_MON_KERNEL_MODE)
 		queue_delayed_work(aw882xx->work_queue,
-					&monitor_desc->delay_work, 0);
-	}
+						&monitor_desc->delay_work, 0);
 }
 
 int aw882xx_monitor_stop(struct aw_monitor_desc *monitor_desc)
@@ -532,8 +543,10 @@ int aw882xx_monitor_stop(struct aw_monitor_desc *monitor_desc)
 			struct aw_device, monitor_desc);
 
 	aw_dev_info(aw_dev->dev, "enter");
+	mutex_lock(&monitor_desc->lock);
 	aw_dev->volume_desc.monitor_volume = 0;
 	monitor_desc->mon_start_flag = false;
+	mutex_unlock(&monitor_desc->lock);
 
 	if (monitor_desc->monitor_mode == AW_MON_KERNEL_MODE)
 		cancel_delayed_work_sync(&monitor_desc->delay_work);
@@ -544,8 +557,12 @@ int aw882xx_monitor_stop(struct aw_monitor_desc *monitor_desc)
 
 void aw882xx_monitor_hal_work(struct aw_monitor_desc *monitor_desc, uint32_t *vmax)
 {
-	struct aw_device *aw_dev = container_of(monitor_desc,
-		struct aw_device, monitor_desc);
+	struct aw_device *aw_dev;
+
+	if (!monitor_desc || !vmax)
+		return;
+
+	aw_dev = container_of(monitor_desc, struct aw_device, monitor_desc);
 
 	if (monitor_desc->mon_start_flag) {
 		aw_monitor_work_func(&monitor_desc->delay_work.work);
@@ -557,11 +574,18 @@ void aw882xx_monitor_hal_work(struct aw_monitor_desc *monitor_desc, uint32_t *vm
 
 void aw882xx_monitor_hal_get_time(struct aw_monitor_desc *monitor_desc, uint32_t *time)
 {
-	struct aw_device *aw_dev = container_of(monitor_desc,
-			struct aw_device, monitor_desc);
-	struct aw_monitor_cfg *monitor_cfg = &aw_dev->monitor_desc.monitor_cfg;
+	struct aw_monitor_cfg *monitor_cfg;
+	struct aw_device *aw_dev;
 
+	if (!monitor_desc || !time)
+		return;
+
+	aw_dev = container_of(monitor_desc, struct aw_device, monitor_desc);
+	monitor_cfg = &aw_dev->monitor_desc.monitor_cfg;
+
+	mutex_lock(&monitor_desc->lock);
 	*time = monitor_cfg->monitor_time;
+	mutex_unlock(&monitor_desc->lock);
 }
 
 
@@ -571,22 +595,71 @@ void aw882xx_monitor_hal_get_time(struct aw_monitor_desc *monitor_desc, uint32_t
 static int aw_monitor_param_check_sum(struct aw_device *aw_dev,
 					uint8_t *data, uint32_t data_len)
 {
-	int i, check_sum = 0;
+	uint32_t check_sum = 0;
+	uint32_t i;
 	struct aw_monitor_hdr *monitor_hdr =
 		(struct aw_monitor_hdr *)data;
 
 	if (data_len < sizeof(struct aw_monitor_hdr)) {
 		aw_dev_err(aw_dev->dev, "data size smaller than hdr , please check monitor bin");
-		return -ENOMEM;
+		return -EINVAL;
 	}
 
 	for (i = 4; i < data_len; i++)
 		check_sum += (uint8_t)data[i];
 
 	if (monitor_hdr->check_sum != check_sum) {
-		aw_dev_err(aw_dev->dev, "check_sum[%d] is not equal to actual check_sum[%d]",
+		aw_dev_err(aw_dev->dev, "check_sum[%u] is not equal to actual check_sum[%u]",
 				monitor_hdr->check_sum, check_sum);
-		return -ENOMEM;
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int aw_monitor_check_table(struct aw_device *aw_dev, const char *name,
+			uint32_t offset, uint32_t count, uint32_t entry_size,
+			uint32_t header_len, uint32_t data_len)
+{
+	if (offset > data_len || count > U8_MAX ||
+	    (count && offset < header_len) ||
+	    (count && entry_size != AW_TABLE_SIZE) ||
+	    count > (data_len - offset) / AW_TABLE_SIZE) {
+		aw_dev_err(aw_dev->dev,
+			"%s table offset/count/size exceeds firmware: %u/%u/%u in %u",
+			name, offset, count, entry_size, data_len);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int aw_monitor_check_tables(struct aw_device *aw_dev,
+			uint32_t temp_offset, uint32_t temp_num,
+			uint32_t single_temp_size, uint32_t vol_offset,
+			uint32_t vol_num, uint32_t single_vol_size,
+			uint32_t header_len, uint32_t data_len)
+{
+	size_t temp_end;
+	size_t vol_end;
+	int ret;
+
+	ret = aw_monitor_check_table(aw_dev, "temperature", temp_offset,
+			temp_num, single_temp_size, header_len, data_len);
+	if (ret)
+		return ret;
+
+	ret = aw_monitor_check_table(aw_dev, "voltage", vol_offset,
+			vol_num, single_vol_size, header_len, data_len);
+	if (ret)
+		return ret;
+
+	temp_end = (size_t)temp_offset + temp_num * AW_TABLE_SIZE;
+	vol_end = (size_t)vol_offset + vol_num * AW_TABLE_SIZE;
+	if (temp_num && vol_num && temp_offset < vol_end &&
+	    vol_offset < temp_end) {
+		aw_dev_err(aw_dev->dev, "temperature and voltage tables overlap");
+		return -EINVAL;
 	}
 
 	return 0;
@@ -596,133 +669,61 @@ static int aw_monitor_check_fw(struct aw_device *aw_dev,
 					uint8_t *data, uint32_t data_len)
 {
 	struct aw_monitor_hdr *monitor_hdr =
-		(struct aw_monitor_hdr *)data;
-	int temp_size, vol_size;
+			(struct aw_monitor_hdr *)data;
 
 	if (data_len < sizeof(struct aw_monitor_hdr)) {
 		aw_dev_err(aw_dev->dev, "params size[%d] < struct aw_monitor_hdr size[%d]!",
 			data_len, (int)sizeof(struct aw_monitor_hdr));
-		return -ENOMEM;
+		return -EINVAL;
 	}
 
-	if (monitor_hdr->temp_offset > data_len) {
-		aw_dev_err(aw_dev->dev, "temp_offset[%d] overflow file size[%d]!",
-			monitor_hdr->temp_offset, data_len);
-		return -ENOMEM;
-	}
-
-	if (monitor_hdr->vol_offset > data_len) {
-		aw_dev_err(aw_dev->dev, "vol_offset[%d] overflow file size[%d]!",
-			monitor_hdr->vol_offset, data_len);
-		return -ENOMEM;
-	}
-
-	temp_size = monitor_hdr->temp_num * monitor_hdr->single_temp_size;
-	if (temp_size > data_len) {
-		aw_dev_err(aw_dev->dev, "temp_size:[%d] overflow file size[%d]!",
-			temp_size, data_len);
-		return -ENOMEM;
-	}
-
-	vol_size = monitor_hdr->vol_num * monitor_hdr->single_vol_size;
-	if (vol_size > data_len) {
-		aw_dev_err(aw_dev->dev, "vol_size:[%d] overflow file size[%d]!",
-			vol_size, data_len);
-		return -ENOMEM;
-	}
-
-	return 0;
+	return aw_monitor_check_tables(aw_dev, monitor_hdr->temp_offset,
+		monitor_hdr->temp_num, monitor_hdr->single_temp_size,
+		monitor_hdr->vol_offset, monitor_hdr->vol_num,
+		monitor_hdr->single_vol_size, sizeof(*monitor_hdr), data_len);
 }
 
 static int aw_monitor_check_fw_v_0_1_1(struct aw_device *aw_dev,
 					uint8_t *data, uint32_t data_len)
 {
 	struct aw_monitor_hdr_v_0_1_1 *monitor_hdr =
-				(struct aw_monitor_hdr_v_0_1_1 *)data;
-	int temp_size, vol_size;
+					(struct aw_monitor_hdr_v_0_1_1 *)data;
 
 	if (data_len < sizeof(struct aw_monitor_hdr_v_0_1_1)) {
 		aw_dev_err(aw_dev->dev, "params size[%d] < struct aw_monitor_hdr size[%d]!",
 			data_len, (int)sizeof(struct aw_monitor_hdr_v_0_1_1));
-		return -ENOMEM;
+		return -EINVAL;
 	}
 
-	if (monitor_hdr->temp_offset > data_len) {
-		aw_dev_err(aw_dev->dev, "temp_offset[%d] overflow file size[%d]!",
-			monitor_hdr->temp_offset, data_len);
-		return -ENOMEM;
-	}
-
-	if (monitor_hdr->vol_offset > data_len) {
-		aw_dev_err(aw_dev->dev, "vol_offset[%d] overflow file size[%d]!",
-			monitor_hdr->vol_offset, data_len);
-		return -ENOMEM;
-	}
-
-	temp_size = monitor_hdr->temp_num * monitor_hdr->single_temp_size;
-	if (temp_size > data_len) {
-		aw_dev_err(aw_dev->dev, "temp_size:[%d] overflow file size[%d]!",
-			temp_size, data_len);
-		return -ENOMEM;
-	}
-
-	vol_size = monitor_hdr->vol_num * monitor_hdr->single_vol_size;
-	if (vol_size > data_len) {
-		aw_dev_err(aw_dev->dev, "vol_size:[%d] overflow file size[%d]!",
-			vol_size, data_len);
-		return -ENOMEM;
-	}
-
-	return 0;
+	return aw_monitor_check_tables(aw_dev, monitor_hdr->temp_offset,
+		monitor_hdr->temp_num, monitor_hdr->single_temp_size,
+		monitor_hdr->vol_offset, monitor_hdr->vol_num,
+		monitor_hdr->single_vol_size, sizeof(*monitor_hdr), data_len);
 }
 
 static int aw_monitor_check_fw_v_0_1_2(struct aw_device *aw_dev,
 					uint8_t *data, uint32_t data_len)
 {
 	struct aw_monitor_hdr_v_0_1_2 *monitor_hdr =
-				(struct aw_monitor_hdr_v_0_1_2 *)data;
-	int temp_size, vol_size;
+					(struct aw_monitor_hdr_v_0_1_2 *)data;
 
 	if (data_len < sizeof(struct aw_monitor_hdr_v_0_1_2)) {
 		aw_dev_err(aw_dev->dev, "params size[%d] < struct aw_monitor_hdr size[%d]!",
 			data_len, (int)sizeof(struct aw_monitor_hdr_v_0_1_2));
-		return -ENOMEM;
+		return -EINVAL;
 	}
 
-	if (monitor_hdr->temp_offset > data_len) {
-		aw_dev_err(aw_dev->dev, "temp_offset[%d] overflow file size[%d]!",
-			monitor_hdr->temp_offset, data_len);
-		return -ENOMEM;
-	}
-
-	if (monitor_hdr->vol_offset > data_len) {
-		aw_dev_err(aw_dev->dev, "vol_offset[%d] overflow file size[%d]!",
-			monitor_hdr->vol_offset, data_len);
-		return -ENOMEM;
-	}
-
-	temp_size = monitor_hdr->temp_num * monitor_hdr->single_temp_size;
-	if (temp_size > data_len) {
-		aw_dev_err(aw_dev->dev, "temp_size:[%d] overflow file size[%d]!",
-			temp_size, data_len);
-		return -ENOMEM;
-	}
-
-	vol_size = monitor_hdr->vol_num * monitor_hdr->single_vol_size;
-	if (vol_size > data_len) {
-		aw_dev_err(aw_dev->dev, "vol_size:[%d] overflow file size[%d]!",
-			vol_size, data_len);
-		return -ENOMEM;
-	}
-
-	return 0;
+	return aw_monitor_check_tables(aw_dev, monitor_hdr->temp_offset,
+		monitor_hdr->temp_num, monitor_hdr->single_temp_size,
+		monitor_hdr->vol_offset, monitor_hdr->vol_num,
+		monitor_hdr->single_vol_size, sizeof(*monitor_hdr), data_len);
 }
 
-static void aw_monitor_parse_hdr(struct aw_device *aw_dev, uint8_t *data)
+static void aw_monitor_parse_hdr(struct aw_device *aw_dev, uint8_t *data,
+				 struct aw_monitor_cfg *monitor_cfg)
 {
 	struct aw_monitor_hdr *monitor_hdr =
 			(struct aw_monitor_hdr *)data;
-	struct aw_monitor_cfg *monitor_cfg = &aw_dev->monitor_desc.monitor_cfg;
 
 	monitor_cfg->monitor_switch = monitor_hdr->monitor_switch;
 	monitor_cfg->monitor_time = monitor_hdr->monitor_time;
@@ -735,8 +736,8 @@ static void aw_monitor_parse_hdr(struct aw_device *aw_dev, uint8_t *data)
 	monitor_cfg->vol_switch = monitor_hdr->vol_switch;
 	monitor_cfg->vol_aplha = monitor_hdr->vol_aplha;
 
-	aw_dev_info(aw_dev->dev, "chip name:%s",
-		monitor_hdr->chip_type);
+	aw_dev_info(aw_dev->dev, "chip name:%.*s",
+		(int)sizeof(monitor_hdr->chip_type), monitor_hdr->chip_type);
 	aw_dev_info(aw_dev->dev, "ui ver:0x%x",
 		monitor_hdr->ui_ver);
 
@@ -753,11 +754,11 @@ static void aw_monitor_parse_hdr(struct aw_device *aw_dev, uint8_t *data)
 		monitor_cfg->vol_switch, monitor_cfg->vol_aplha);
 }
 
-static void aw_monitor_parse_hdr_v_0_1_1(struct aw_device *aw_dev, uint8_t *data)
+static void aw_monitor_parse_hdr_v_0_1_1(struct aw_device *aw_dev, uint8_t *data,
+					 struct aw_monitor_cfg *monitor_cfg)
 {
 	struct aw_monitor_hdr_v_0_1_1 *monitor_hdr =
 			(struct aw_monitor_hdr_v_0_1_1 *)data;
-	struct aw_monitor_cfg *monitor_cfg = &aw_dev->monitor_desc.monitor_cfg;
 
 	monitor_cfg->monitor_switch = (monitor_hdr->enable_flag >> MONITOR_EN_BIT) & MONITOR_EN_MASK;
 	monitor_cfg->monitor_time = monitor_hdr->monitor_time;
@@ -771,8 +772,8 @@ static void aw_monitor_parse_hdr_v_0_1_1(struct aw_device *aw_dev, uint8_t *data
 	monitor_cfg->vol_switch = (monitor_hdr->enable_flag >> MONITOR_VOL_EN_BIT) & MONITOR_EN_MASK;
 	monitor_cfg->vol_aplha = monitor_hdr->vol_aplha;
 
-	aw_dev_info(aw_dev->dev, "chip name:%s",
-		monitor_hdr->chip_type);
+	aw_dev_info(aw_dev->dev, "chip name:%.*s",
+		(int)sizeof(monitor_hdr->chip_type), monitor_hdr->chip_type);
 	aw_dev_info(aw_dev->dev, "ui ver:0x%x",
 		monitor_hdr->ui_ver);
 
@@ -789,11 +790,11 @@ static void aw_monitor_parse_hdr_v_0_1_1(struct aw_device *aw_dev, uint8_t *data
 		monitor_cfg->vol_switch, monitor_cfg->vol_aplha);
 }
 
-static void aw_monitor_parse_hdr_v_0_1_2(struct aw_device *aw_dev, uint8_t *data)
+static void aw_monitor_parse_hdr_v_0_1_2(struct aw_device *aw_dev, uint8_t *data,
+					 struct aw_monitor_cfg *monitor_cfg)
 {
 	struct aw_monitor_hdr_v_0_1_2 *monitor_hdr =
 			(struct aw_monitor_hdr_v_0_1_2 *)data;
-	struct aw_monitor_cfg *monitor_cfg = &aw_dev->monitor_desc.monitor_cfg;
 
 	monitor_cfg->monitor_switch = (monitor_hdr->enable_flag >> MONITOR_EN_BIT) & MONITOR_EN_MASK;
 	monitor_cfg->monitor_time = monitor_hdr->monitor_time;
@@ -813,8 +814,8 @@ static void aw_monitor_parse_hdr_v_0_1_2(struct aw_device *aw_dev, uint8_t *data
 	monitor_cfg->vol_mode =
 		(monitor_hdr->enable_flag >> MONITOR_VOLTAGE_MODE_BIT) & MONITOR_EN_MASK;
 
-	aw_dev_info(aw_dev->dev, "chip name:%s",
-		monitor_hdr->chip_type);
+	aw_dev_info(aw_dev->dev, "chip name:%.*s",
+		(int)sizeof(monitor_hdr->chip_type), monitor_hdr->chip_type);
 	aw_dev_info(aw_dev->dev, "ui ver:0x%x",
 		monitor_hdr->ui_ver);
 
@@ -866,23 +867,17 @@ static void aw_monitor_write_data_to_table(struct aw_device *aw_dev,
 }
 
 
-static int aw_monitor_parse_temp_data(struct aw_device *aw_dev, uint8_t *data)
+static int aw_monitor_parse_temp_data(struct aw_device *aw_dev, uint8_t *data,
+				      struct aw_monitor_cfg *monitor_cfg)
 {
 	struct aw_monitor_hdr *monitor_hdr =
 			(struct aw_monitor_hdr *)data;
-	struct aw_table_info *temp_info =
-		&aw_dev->monitor_desc.monitor_cfg.temp_info;
+	struct aw_table_info *temp_info = &monitor_cfg->temp_info;
 
 	aw_dev_info(aw_dev->dev, "===parse temp start ===");
 
-	if (temp_info->aw_table != NULL) {
-		devm_kfree(aw_dev->dev, temp_info->aw_table);
-		temp_info->aw_table = NULL;
-	}
-
-	temp_info->aw_table = devm_kzalloc(aw_dev->dev,
-					(monitor_hdr->temp_num * AW_TABLE_SIZE),
-					GFP_KERNEL);
+	temp_info->aw_table = kcalloc(monitor_hdr->temp_num,
+				      sizeof(*temp_info->aw_table), GFP_KERNEL);
 	if (temp_info->aw_table == NULL)
 		return -ENOMEM;
 
@@ -893,23 +888,17 @@ static int aw_monitor_parse_temp_data(struct aw_device *aw_dev, uint8_t *data)
 	return 0;
 }
 
-static int aw_monitor_parse_temp_data_v_0_1_1(struct aw_device *aw_dev, uint8_t *data)
+static int aw_monitor_parse_temp_data_v_0_1_1(struct aw_device *aw_dev,
+			uint8_t *data, struct aw_monitor_cfg *monitor_cfg)
 {
 	struct aw_monitor_hdr_v_0_1_1 *monitor_hdr =
 			(struct aw_monitor_hdr_v_0_1_1 *)data;
-	struct aw_table_info *temp_info =
-		&aw_dev->monitor_desc.monitor_cfg.temp_info;
+	struct aw_table_info *temp_info = &monitor_cfg->temp_info;
 
 	aw_dev_info(aw_dev->dev, "===parse temp start ===");
 
-	if (temp_info->aw_table != NULL) {
-		devm_kfree(aw_dev->dev, temp_info->aw_table);
-		temp_info->aw_table = NULL;
-	}
-
-	temp_info->aw_table = devm_kzalloc(aw_dev->dev,
-					(monitor_hdr->temp_num * AW_TABLE_SIZE),
-					GFP_KERNEL);
+	temp_info->aw_table = kcalloc(monitor_hdr->temp_num,
+				      sizeof(*temp_info->aw_table), GFP_KERNEL);
 	if (temp_info->aw_table == NULL)
 		return -ENOMEM;
 
@@ -920,23 +909,17 @@ static int aw_monitor_parse_temp_data_v_0_1_1(struct aw_device *aw_dev, uint8_t 
 	return 0;
 }
 
-static int aw_monitor_parse_temp_data_v_0_1_2(struct aw_device *aw_dev, uint8_t *data)
+static int aw_monitor_parse_temp_data_v_0_1_2(struct aw_device *aw_dev,
+			uint8_t *data, struct aw_monitor_cfg *monitor_cfg)
 {
 	struct aw_monitor_hdr_v_0_1_2 *monitor_hdr =
 			(struct aw_monitor_hdr_v_0_1_2 *)data;
-	struct aw_table_info *temp_info =
-		&aw_dev->monitor_desc.monitor_cfg.temp_info;
+	struct aw_table_info *temp_info = &monitor_cfg->temp_info;
 
 	aw_dev_info(aw_dev->dev, "===parse temp start ===");
 
-	if (temp_info->aw_table != NULL) {
-		devm_kfree(aw_dev->dev, temp_info->aw_table);
-		temp_info->aw_table = NULL;
-	}
-
-	temp_info->aw_table = devm_kzalloc(aw_dev->dev,
-					(monitor_hdr->temp_num * AW_TABLE_SIZE),
-					GFP_KERNEL);
+	temp_info->aw_table = kcalloc(monitor_hdr->temp_num,
+				      sizeof(*temp_info->aw_table), GFP_KERNEL);
 	if (temp_info->aw_table == NULL)
 		return -ENOMEM;
 
@@ -947,22 +930,16 @@ static int aw_monitor_parse_temp_data_v_0_1_2(struct aw_device *aw_dev, uint8_t 
 	return 0;
 }
 
-static int aw_monitor_parse_vol_data(struct aw_device *aw_dev, uint8_t *data)
+static int aw_monitor_parse_vol_data(struct aw_device *aw_dev, uint8_t *data,
+				     struct aw_monitor_cfg *monitor_cfg)
 {
 	struct aw_monitor_hdr *monitor_hdr =
 			(struct aw_monitor_hdr *)data;
-	struct aw_table_info *vol_info =
-		&aw_dev->monitor_desc.monitor_cfg.vol_info;
+	struct aw_table_info *vol_info = &monitor_cfg->vol_info;
 
 	aw_dev_info(aw_dev->dev, "===parse vol start ===");
-	if (vol_info->aw_table != NULL) {
-		devm_kfree(aw_dev->dev, vol_info->aw_table);
-		vol_info->aw_table = NULL;
-	}
-
-	vol_info->aw_table = devm_kzalloc(aw_dev->dev,
-					(monitor_hdr->vol_num * AW_TABLE_SIZE),
-					GFP_KERNEL);
+	vol_info->aw_table = kcalloc(monitor_hdr->vol_num,
+				     sizeof(*vol_info->aw_table), GFP_KERNEL);
 	if (vol_info->aw_table == NULL)
 		return -ENOMEM;
 
@@ -973,22 +950,16 @@ static int aw_monitor_parse_vol_data(struct aw_device *aw_dev, uint8_t *data)
 	return 0;
 }
 
-static int aw_monitor_parse_vol_data_v_0_1_1(struct aw_device *aw_dev, uint8_t *data)
+static int aw_monitor_parse_vol_data_v_0_1_1(struct aw_device *aw_dev,
+			uint8_t *data, struct aw_monitor_cfg *monitor_cfg)
 {
 	struct aw_monitor_hdr_v_0_1_1 *monitor_hdr =
 			(struct aw_monitor_hdr_v_0_1_1 *)data;
-	struct aw_table_info *vol_info =
-		&aw_dev->monitor_desc.monitor_cfg.vol_info;
+	struct aw_table_info *vol_info = &monitor_cfg->vol_info;
 
 	aw_dev_info(aw_dev->dev, "===parse vol start ===");
-	if (vol_info->aw_table != NULL) {
-		devm_kfree(aw_dev->dev, vol_info->aw_table);
-		vol_info->aw_table = NULL;
-	}
-
-	vol_info->aw_table = devm_kzalloc(aw_dev->dev,
-					(monitor_hdr->vol_num * AW_TABLE_SIZE),
-					GFP_KERNEL);
+	vol_info->aw_table = kcalloc(monitor_hdr->vol_num,
+				     sizeof(*vol_info->aw_table), GFP_KERNEL);
 	if (vol_info->aw_table == NULL)
 		return -ENOMEM;
 
@@ -999,22 +970,16 @@ static int aw_monitor_parse_vol_data_v_0_1_1(struct aw_device *aw_dev, uint8_t *
 	return 0;
 }
 
-static int aw_monitor_parse_vol_data_v_0_1_2(struct aw_device *aw_dev, uint8_t *data)
+static int aw_monitor_parse_vol_data_v_0_1_2(struct aw_device *aw_dev,
+			uint8_t *data, struct aw_monitor_cfg *monitor_cfg)
 {
 	struct aw_monitor_hdr_v_0_1_2 *monitor_hdr =
 			(struct aw_monitor_hdr_v_0_1_2 *)data;
-	struct aw_table_info *vol_info =
-		&aw_dev->monitor_desc.monitor_cfg.vol_info;
+	struct aw_table_info *vol_info = &monitor_cfg->vol_info;
 
 	aw_dev_info(aw_dev->dev, "===parse vol start ===");
-	if (vol_info->aw_table != NULL) {
-		devm_kfree(aw_dev->dev, vol_info->aw_table);
-		vol_info->aw_table = NULL;
-	}
-
-	vol_info->aw_table = devm_kzalloc(aw_dev->dev,
-					(monitor_hdr->vol_num * AW_TABLE_SIZE),
-					GFP_KERNEL);
+	vol_info->aw_table = kcalloc(monitor_hdr->vol_num,
+				     sizeof(*vol_info->aw_table), GFP_KERNEL);
 	if (vol_info->aw_table == NULL)
 		return -ENOMEM;
 
@@ -1023,13 +988,100 @@ static int aw_monitor_parse_vol_data_v_0_1_2(struct aw_device *aw_dev, uint8_t *
 		&data[monitor_hdr->vol_offset]);
 	aw_dev_info(aw_dev->dev, "===parse vol end ===");
 	return 0;
+}
+
+static void aw_monitor_release_cfg(struct aw_monitor_cfg *monitor_cfg)
+{
+	kfree(monitor_cfg->temp_info.aw_table);
+	kfree(monitor_cfg->vol_info.aw_table);
+	memset(monitor_cfg, 0, sizeof(*monitor_cfg));
+}
+
+static int aw_monitor_validate_table(struct aw_device *aw_dev,
+					   const char *name,
+					   const struct aw_table_info *table_info)
+{
+	unsigned int i;
+
+	if (!table_info->table_num || !table_info->aw_table) {
+		aw_dev_err(aw_dev->dev, "%s monitor table is empty", name);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < table_info->table_num; i++) {
+		if (table_info->aw_table[i].min_val >
+		    table_info->aw_table[i].max_val) {
+			aw_dev_err(aw_dev->dev,
+				    "%s table %u has invalid range %d..%d",
+				    name, i, table_info->aw_table[i].min_val,
+				    table_info->aw_table[i].max_val);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static int aw_monitor_validate_cfg(struct aw_device *aw_dev,
+					 const struct aw_monitor_cfg *monitor_cfg)
+{
+	int ret;
+
+	if (!monitor_cfg->monitor_time || !monitor_cfg->monitor_count ||
+	    monitor_cfg->monitor_count > U8_MAX ||
+	    monitor_cfg->monitor_switch > 1 ||
+	    monitor_cfg->temp_switch > 1 || monitor_cfg->vol_switch > 1 ||
+	    monitor_cfg->ipeak_switch > 1 || monitor_cfg->gain_switch > 1 ||
+	    monitor_cfg->vmax_switch > 1 || monitor_cfg->logic_switch > 1) {
+		aw_dev_err(aw_dev->dev, "invalid monitor control values");
+		return -EINVAL;
+	}
+
+	if (monitor_cfg->temp_switch) {
+		if (monitor_cfg->temp_aplha > 1000)
+			return -EINVAL;
+		ret = aw_monitor_validate_table(aw_dev, "temperature",
+						&monitor_cfg->temp_info);
+		if (ret)
+			return ret;
+	}
+
+	if (monitor_cfg->vol_switch) {
+		if (monitor_cfg->vol_aplha > 1000)
+			return -EINVAL;
+		ret = aw_monitor_validate_table(aw_dev, "voltage",
+						&monitor_cfg->vol_info);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static void aw_monitor_commit_cfg(struct aw_device *aw_dev,
+				  struct aw_monitor_cfg *new_cfg)
+{
+	struct aw_monitor_desc *monitor = &aw_dev->monitor_desc;
+	struct aw_monitor_cfg old_cfg;
+
+	mutex_lock(&monitor->lock);
+	old_cfg = monitor->monitor_cfg;
+	monitor->monitor_cfg = *new_cfg;
+	memset(new_cfg, 0, sizeof(*new_cfg));
+	monitor->first_entry = AW_FIRST_ENTRY;
+	monitor->samp_count = 0;
+	monitor->vol_trace.sum_val = 0;
+	monitor->temp_trace.sum_val = 0;
+	mutex_unlock(&monitor->lock);
+
+	aw_monitor_release_cfg(&old_cfg);
 }
 
 static int aw_monitor_parse_data(struct aw_device *aw_dev,
-				uint8_t *data, uint32_t data_len)
+					uint8_t *data, uint32_t data_len)
 {
+	struct aw_monitor_cfg new_cfg = { 0 };
 	int ret;
-	struct aw_monitor_cfg *monitor_cfg = &aw_dev->monitor_desc.monitor_cfg;
 
 	ret = aw_monitor_check_fw(aw_dev, data, data_len);
 	if (ret < 0) {
@@ -1037,32 +1089,34 @@ static int aw_monitor_parse_data(struct aw_device *aw_dev,
 		return ret;
 	}
 
-	aw_monitor_parse_hdr(aw_dev, data);
+	aw_monitor_parse_hdr(aw_dev, data, &new_cfg);
 
-	ret = aw_monitor_parse_temp_data(aw_dev, data);
+	ret = aw_monitor_parse_temp_data(aw_dev, data, &new_cfg);
 	if (ret < 0)
-		return ret;
+		goto err_release;
 
-	ret = aw_monitor_parse_vol_data(aw_dev, data);
-	if (ret < 0) {
-		if (monitor_cfg->temp_info.aw_table != NULL) {
-			devm_kfree(aw_dev->dev, monitor_cfg->temp_info.aw_table);
-			monitor_cfg->temp_info.aw_table = NULL;
-			monitor_cfg->temp_info.table_num = 0;
-		}
-		return ret;
-	}
+	ret = aw_monitor_parse_vol_data(aw_dev, data, &new_cfg);
+	if (ret < 0)
+		goto err_release;
+	ret = aw_monitor_validate_cfg(aw_dev, &new_cfg);
+	if (ret < 0)
+		goto err_release;
 
-	monitor_cfg->monitor_status = AW_MON_CFG_OK;
+	new_cfg.monitor_status = AW_MON_CFG_OK;
+	aw_monitor_commit_cfg(aw_dev, &new_cfg);
 	return 0;
+
+err_release:
+	aw_monitor_release_cfg(&new_cfg);
+	return ret;
 }
 
 
 static int aw_monitor_parse_data_v_0_1_1(struct aw_device *aw_dev,
 				uint8_t *data, uint32_t data_len)
 {
+	struct aw_monitor_cfg new_cfg = { 0 };
 	int ret;
-	struct aw_monitor_cfg *monitor_cfg = &aw_dev->monitor_desc.monitor_cfg;
 
 	ret = aw_monitor_check_fw_v_0_1_1(aw_dev, data, data_len);
 	if (ret < 0) {
@@ -1070,31 +1124,33 @@ static int aw_monitor_parse_data_v_0_1_1(struct aw_device *aw_dev,
 		return ret;
 	}
 
-	aw_monitor_parse_hdr_v_0_1_1(aw_dev, data);
+	aw_monitor_parse_hdr_v_0_1_1(aw_dev, data, &new_cfg);
 
-	ret = aw_monitor_parse_temp_data_v_0_1_1(aw_dev, data);
+	ret = aw_monitor_parse_temp_data_v_0_1_1(aw_dev, data, &new_cfg);
 	if (ret < 0)
-		return ret;
+		goto err_release;
 
-	ret = aw_monitor_parse_vol_data_v_0_1_1(aw_dev, data);
-	if (ret < 0) {
-		if (monitor_cfg->temp_info.aw_table != NULL) {
-			devm_kfree(aw_dev->dev, monitor_cfg->temp_info.aw_table);
-			monitor_cfg->temp_info.aw_table = NULL;
-			monitor_cfg->temp_info.table_num = 0;
-		}
-		return ret;
-	}
+	ret = aw_monitor_parse_vol_data_v_0_1_1(aw_dev, data, &new_cfg);
+	if (ret < 0)
+		goto err_release;
+	ret = aw_monitor_validate_cfg(aw_dev, &new_cfg);
+	if (ret < 0)
+		goto err_release;
 
-	monitor_cfg->monitor_status = AW_MON_CFG_OK;
+	new_cfg.monitor_status = AW_MON_CFG_OK;
+	aw_monitor_commit_cfg(aw_dev, &new_cfg);
 	return 0;
+
+err_release:
+	aw_monitor_release_cfg(&new_cfg);
+	return ret;
 }
 
 static int aw_monitor_parse_data_v_0_1_2(struct aw_device *aw_dev,
 				uint8_t *data, uint32_t data_len)
 {
+	struct aw_monitor_cfg new_cfg = { 0 };
 	int ret;
-	struct aw_monitor_cfg *monitor_cfg = &aw_dev->monitor_desc.monitor_cfg;
 
 	ret = aw_monitor_check_fw_v_0_1_2(aw_dev, data, data_len);
 	if (ret < 0) {
@@ -1102,24 +1158,26 @@ static int aw_monitor_parse_data_v_0_1_2(struct aw_device *aw_dev,
 		return ret;
 	}
 
-	aw_monitor_parse_hdr_v_0_1_2(aw_dev, data);
+	aw_monitor_parse_hdr_v_0_1_2(aw_dev, data, &new_cfg);
 
-	ret = aw_monitor_parse_temp_data_v_0_1_2(aw_dev, data);
+	ret = aw_monitor_parse_temp_data_v_0_1_2(aw_dev, data, &new_cfg);
 	if (ret < 0)
-		return ret;
+		goto err_release;
 
-	ret = aw_monitor_parse_vol_data_v_0_1_2(aw_dev, data);
-	if (ret < 0) {
-		if (monitor_cfg->temp_info.aw_table != NULL) {
-			devm_kfree(aw_dev->dev, monitor_cfg->temp_info.aw_table);
-			monitor_cfg->temp_info.aw_table = NULL;
-			monitor_cfg->temp_info.table_num = 0;
-		}
-		return ret;
-	}
+	ret = aw_monitor_parse_vol_data_v_0_1_2(aw_dev, data, &new_cfg);
+	if (ret < 0)
+		goto err_release;
+	ret = aw_monitor_validate_cfg(aw_dev, &new_cfg);
+	if (ret < 0)
+		goto err_release;
 
-	monitor_cfg->monitor_status = AW_MON_CFG_OK;
+	new_cfg.monitor_status = AW_MON_CFG_OK;
+	aw_monitor_commit_cfg(aw_dev, &new_cfg);
 	return 0;
+
+err_release:
+	aw_monitor_release_cfg(&new_cfg);
+	return ret;
 }
 
 int aw882xx_monitor_parse_fw(struct aw_monitor_desc *monitor_desc,
@@ -1158,22 +1216,15 @@ int aw882xx_monitor_parse_fw(struct aw_monitor_desc *monitor_desc,
 
 static void aw_monitor_free_firmware(struct aw_device *aw_dev)
 {
-	struct aw_monitor_cfg *monitor_cfg =
-				&aw_dev->monitor_desc.monitor_cfg;
+	struct aw_monitor_desc *monitor = &aw_dev->monitor_desc;
+	struct aw_monitor_cfg old_cfg;
 
-	monitor_cfg->monitor_status = AW_MON_CFG_ST;
+	mutex_lock(&monitor->lock);
+	old_cfg = monitor->monitor_cfg;
+	memset(&monitor->monitor_cfg, 0, sizeof(monitor->monitor_cfg));
+	mutex_unlock(&monitor->lock);
 
-	if (monitor_cfg->temp_info.aw_table != NULL) {
-		devm_kfree(aw_dev->dev, monitor_cfg->temp_info.aw_table);
-		monitor_cfg->temp_info.aw_table = NULL;
-	}
-
-	if (monitor_cfg->vol_info.aw_table != NULL) {
-		devm_kfree(aw_dev->dev, monitor_cfg->vol_info.aw_table);
-		monitor_cfg->vol_info.aw_table = NULL;
-	}
-
-	memset(monitor_cfg, 0, sizeof(struct aw_monitor_cfg));
+	aw_monitor_release_cfg(&old_cfg);
 }
 
 static int aw_monitor_real_time_update_monitor(struct aw_device *aw_dev)
@@ -1187,6 +1238,10 @@ static int aw_monitor_real_time_update_monitor(struct aw_device *aw_dev)
 		aw_dev_err(aw_dev->dev, "failed to read %s", aw_dev->monitor_name);
 		release_firmware(cont);
 		return ret;
+	}
+	if (cont->size > U32_MAX) {
+		release_firmware(cont);
+		return -EFBIG;
 	}
 
 	aw_monitor_cnt = devm_kzalloc(aw_dev->dev,
@@ -1306,12 +1361,21 @@ static ssize_t monitor_store(struct device *dev,
 
 	aw_dev_info(aw_dev->dev, "monitor enable set =%d", enable);
 
-	if (aw_dev->monitor_desc.monitor_cfg.monitor_switch == enable)
+	if (enable > 1)
+		return -EINVAL;
+
+	mutex_lock(&aw_dev->monitor_desc.lock);
+	if (aw_dev->monitor_desc.monitor_cfg.monitor_switch == enable) {
+		mutex_unlock(&aw_dev->monitor_desc.lock);
 		return count;
+	}
 
 	aw_dev->monitor_desc.monitor_cfg.monitor_switch = enable;
+	mutex_unlock(&aw_dev->monitor_desc.lock);
 	if (enable)
 		aw882xx_monitor_start(&aw_dev->monitor_desc);
+	else
+		aw882xx_monitor_stop(&aw_dev->monitor_desc);
 
 	return count;
 }
@@ -1323,9 +1387,11 @@ static ssize_t monitor_show(struct device *dev,
 	struct aw_device *aw_dev = aw882xx->aw_pa;
 	ssize_t len = 0;
 
-	len += snprintf(buf+len, PAGE_SIZE-len,
-		"monitor enable: %d\n",
-		aw_dev->monitor_desc.monitor_cfg.monitor_switch);
+	mutex_lock(&aw_dev->monitor_desc.lock);
+	len += scnprintf(buf+len, PAGE_SIZE-len,
+			"monitor enable: %d\n",
+			aw_dev->monitor_desc.monitor_cfg.monitor_switch);
+	mutex_unlock(&aw_dev->monitor_desc.lock);
 	return len;
 }
 
@@ -1348,10 +1414,11 @@ static ssize_t monitor_update_store(struct device *dev,
 
 	if (update) {
 		aw882xx_monitor_stop(&aw_dev->monitor_desc);
-		aw_monitor_free_firmware(aw_dev);
 		ret = aw_monitor_real_time_update_monitor(aw_dev);
-		if (ret < 0)
+		if (ret < 0) {
+			aw882xx_monitor_start(&aw_dev->monitor_desc);
 			return ret;
+		}
 		aw882xx_monitor_start(&aw_dev->monitor_desc);
 	}
 
@@ -1397,7 +1464,7 @@ static void aw_monitor_parse_mode(struct aw_device *aw_dev)
 	aw_dev_info(aw_dev->dev, "read monitor-mode value is : %d", monitor->monitor_mode);
 }
 
-void aw882xx_monitor_init(struct aw_monitor_desc *monitor_desc)
+int aw882xx_monitor_init(struct aw_monitor_desc *monitor_desc)
 {
 	int ret;
 	struct aw_device *aw_dev = container_of(monitor_desc,
@@ -1410,13 +1477,18 @@ void aw882xx_monitor_init(struct aw_monitor_desc *monitor_desc)
 #endif
 
 
+	mutex_init(&monitor_desc->lock);
 	aw_monitor_parse_mode(aw_dev);
 	INIT_DELAYED_WORK(&monitor_desc->delay_work, aw_monitor_work_func);
 
 	ret = sysfs_create_group(&aw_dev->dev->kobj,
 				&aw_monitor_attr_group);
-	if (ret < 0)
+	if (ret < 0) {
 		aw_dev_err(aw_dev->dev, "error creating sysfs attr files");
+		return ret;
+	}
+
+	return 0;
 }
 
 void aw882xx_monitor_deinit(struct aw_monitor_desc *monitor_desc)
@@ -1427,5 +1499,6 @@ void aw882xx_monitor_deinit(struct aw_monitor_desc *monitor_desc)
 	aw882xx_monitor_stop(monitor_desc);
 
 	sysfs_remove_group(&aw_dev->dev->kobj, &aw_monitor_attr_group);
+	aw_monitor_free_firmware(aw_dev);
 }
 

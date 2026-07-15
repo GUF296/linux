@@ -33,11 +33,14 @@ static unsigned int g_spin_value;
 
 static DEFINE_MUTEX(g_spin_lock);
 
-int aw_dev_set_channal_mode(struct aw_device *aw_dev,
+static int aw_dev_set_channal_mode(struct aw_device *aw_dev,
 			struct aw_spin_desc spin_desc, uint32_t spin_val)
 {
 	int ret;
 	struct aw_reg_ch *rx_desc = &spin_desc.rx_desc;
+
+	if (spin_val >= AW_SPIN_MAX)
+		return -EINVAL;
 
 	ret = aw_dev->ops.aw_i2c_write_bits(aw_dev, rx_desc->reg, rx_desc->mask,
 					spin_desc.spin_table[spin_val].rx_val);
@@ -51,46 +54,51 @@ int aw_dev_set_channal_mode(struct aw_device *aw_dev,
 }
 
 static int aw_reg_write_spin(struct aw_device *aw_dev,
-				uint32_t spin_val, bool mixer_en)
+					uint32_t spin_val, bool mixer_en)
 {
-	int ret;
-	struct aw_device *local_dev = NULL;
-	struct list_head *pos = NULL;
-	struct list_head *dev_list = NULL;
+	struct aw_device_list dev_list;
+	struct aw_device *local_dev;
+	unsigned int i, enabled = 0;
+	int cleanup_ret, ret;
 
-	ret = aw882xx_dev_get_list_head(&dev_list);
+	ret = aw882xx_dev_get_list(&dev_list);
 	if (ret) {
 		aw_dev_err(aw_dev->dev, "get dev list failed");
 		return ret;
 	}
 
 	if ((g_spin_mode == AW_REG_MIXER_SPIN_MODE) && (mixer_en)) {
-		list_for_each(pos, dev_list) {
-			local_dev = container_of(pos, struct aw_device, list_node);
+		for (i = 0; i < dev_list.count; i++) {
+			local_dev = dev_list.devices[i];
 			ret = aw882xx_dsp_set_mixer_en(local_dev, AW_AUDIO_MIX_ENABLE);
 			if (ret)
-				return ret;
+				goto out_disable;
+			enabled++;
 		}
 	}
 
 	usleep_range(AW_100000_US, AW_100000_US + 10);
 
-	list_for_each(pos, dev_list) {
-		local_dev = container_of(pos, struct aw_device, list_node);
+	for (i = 0; i < dev_list.count; i++) {
+		local_dev = dev_list.devices[i];
 		ret = aw_dev_set_channal_mode(local_dev, local_dev->spin_desc, spin_val);
 		if (ret < 0) {
 			aw_dev_err(local_dev->dev, "set channal mode failed");
-			return ret;
-		}
-
-		if ((g_spin_mode == AW_REG_MIXER_SPIN_MODE) && (mixer_en)) {
-			ret = aw882xx_dsp_set_mixer_en(aw_dev, AW_AUDIO_MIX_DSIABLE);
-			if (ret)
-				return ret;
+			goto out_disable;
 		}
 	}
 
-	return 0;
+	ret = 0;
+out_disable:
+	while (enabled) {
+		local_dev = dev_list.devices[--enabled];
+		cleanup_ret = aw882xx_dsp_set_mixer_en(local_dev,
+							 AW_AUDIO_MIX_DSIABLE);
+		if (!ret && cleanup_ret)
+			ret = cleanup_ret;
+	}
+	aw882xx_dev_put_list(&dev_list);
+	return ret;
 }
 
 int aw882xx_spin_set_record_val(struct aw_device *aw_dev)
@@ -125,6 +133,9 @@ int aw882xx_spin_value_get(struct aw_device *aw_dev,
 {
 	int ret = 0;
 
+	if (!spin_val)
+		return -EINVAL;
+
 	if (((g_spin_mode == AW_REG_SPIN_MODE) ||
 			(g_spin_mode == AW_REG_MIXER_SPIN_MODE)) || (!pstream))
 		*spin_val = g_spin_value;
@@ -137,6 +148,9 @@ int aw882xx_spin_value_get(struct aw_device *aw_dev,
 int aw882xx_spin_value_set(struct aw_device *aw_dev, uint32_t spin_val, bool pstream)
 {
 	int ret = 0;
+
+	if (spin_val >= AW_SPIN_MAX)
+		return -EINVAL;
 
 	mutex_lock(&g_spin_lock);
 	if (pstream) {
@@ -154,7 +168,8 @@ int aw882xx_spin_value_set(struct aw_device *aw_dev, uint32_t spin_val, bool pst
 		else
 			aw_dev_info(aw_dev->dev, "stream no start only record spin angle");
 	}
-	g_spin_value = spin_val;
+	if (!ret)
+		g_spin_value = spin_val;
 	mutex_unlock(&g_spin_lock);
 
 	return ret;

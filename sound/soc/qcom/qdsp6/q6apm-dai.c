@@ -10,6 +10,7 @@
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include <sound/pcm.h>
 #include <asm/div64.h>
 #include <asm/dma.h>
@@ -56,6 +57,12 @@ enum stream_state {
 	Q6APM_STREAM_RUNNING,
 };
 
+enum drain_state {
+	Q6APM_DRAIN_NONE,
+	Q6APM_DRAIN_REQUESTED,
+	Q6APM_DRAIN_EOS_SENT,
+};
+
 struct q6apm_dai_rtd {
 	struct snd_pcm_substream *substream;
 	struct snd_compr_stream *cstream;
@@ -72,10 +79,16 @@ struct q6apm_dai_rtd {
 	uint16_t bits_per_sample;
 	snd_pcm_uframes_t queue_ptr;
 	bool next_track;
+	bool graph_started;
+	bool fragments_allocated;
+	bool stop_reset;
+	bool reset_pending;
+	bool closing;
 	enum stream_state state;
+	enum drain_state drain_state;
 	struct q6apm_graph *graph;
 	spinlock_t lock;
-	bool notify_on_drain;
+	struct work_struct error_work;
 };
 
 struct q6apm_dai_data {
@@ -122,23 +135,187 @@ static const struct snd_pcm_hardware q6apm_dai_hardware_playback = {
 	.fifo_size =            0,
 };
 
-static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *priv)
+static uint32_t q6apm_compr_reserve_next(struct q6apm_dai_rtd *prtd,
+					 uint32_t *wflags, bool *last)
+{
+	uint64_t avail;
+	uint32_t bytes;
+
+	*wflags = 0;
+	*last = false;
+	if (prtd->state != Q6APM_STREAM_RUNNING || !prtd->pcm_count)
+		return 0;
+	if (prtd->bytes_sent < prtd->copied_total ||
+	    prtd->bytes_received < prtd->bytes_sent) {
+		prtd->state = Q6APM_STREAM_STOPPED;
+		return 0;
+	}
+
+	/* Keep one DSP buffer in flight so completion accounting is ordered. */
+	if (prtd->bytes_sent != prtd->copied_total)
+		return 0;
+
+	avail = prtd->bytes_received - prtd->bytes_sent;
+	if (!avail)
+		return 0;
+	bytes = min_t(uint64_t, avail, prtd->pcm_count);
+	*last = avail <= prtd->pcm_count &&
+		(prtd->cstream->partial_drain ||
+		 prtd->drain_state != Q6APM_DRAIN_NONE);
+	if (*last && prtd->cstream->partial_drain)
+		*wflags |= APM_LAST_BUFFER_FLAG;
+	prtd->bytes_sent += bytes;
+
+	return bytes;
+}
+
+static int q6apm_compr_send_eos(struct q6apm_dai_rtd *prtd)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&prtd->lock, flags);
+	if (prtd->drain_state != Q6APM_DRAIN_REQUESTED) {
+		spin_unlock_irqrestore(&prtd->lock, flags);
+		return 0;
+	}
+	prtd->drain_state = Q6APM_DRAIN_EOS_SENT;
+	spin_unlock_irqrestore(&prtd->lock, flags);
+
+	ret = audioreach_shared_memory_send_eos(prtd->graph);
+	if (ret) {
+		spin_lock_irqsave(&prtd->lock, flags);
+		if (prtd->drain_state == Q6APM_DRAIN_EOS_SENT)
+			prtd->drain_state = Q6APM_DRAIN_NONE;
+		prtd->state = Q6APM_STREAM_STOPPED;
+		spin_unlock_irqrestore(&prtd->lock, flags);
+	}
+
+	return ret;
+}
+
+static int q6apm_compr_submit(struct q6apm_dai_rtd *prtd, uint32_t bytes,
+			       uint32_t wflags, bool send_eos)
+{
+	unsigned long flags;
+	int ret;
+
+	ret = q6apm_write_async(prtd->graph, bytes, 0, 0, wflags);
+	if (ret) {
+		spin_lock_irqsave(&prtd->lock, flags);
+		if (prtd->bytes_sent >= bytes)
+			prtd->bytes_sent -= bytes;
+		prtd->drain_state = Q6APM_DRAIN_NONE;
+		prtd->state = Q6APM_STREAM_STOPPED;
+		spin_unlock_irqrestore(&prtd->lock, flags);
+		return ret;
+	}
+
+	if (send_eos)
+		ret = q6apm_compr_send_eos(prtd);
+
+	return ret;
+}
+
+static void q6apm_compr_reset_counters(struct q6apm_dai_rtd *prtd)
+{
+	prtd->bytes_sent = 0;
+	prtd->bytes_received = 0;
+	prtd->copied_total = 0;
+	prtd->next_track = false;
+	prtd->drain_state = Q6APM_DRAIN_NONE;
+}
+
+static int q6apm_compr_finish_stop_reset(struct q6apm_dai_rtd *prtd)
+{
+	unsigned long flags;
+	bool pending;
+
+	spin_lock_irqsave(&prtd->lock, flags);
+	pending = prtd->reset_pending;
+	spin_unlock_irqrestore(&prtd->lock, flags);
+	if (!pending)
+		return 0;
+
+	/* A peer may have completed a graph-wide flush since our STOP. */
+	q6apm_graph_sync_flush_generation(prtd->graph);
+	if (!q6apm_graph_try_reset_client(prtd->graph))
+		return -EBUSY;
+
+	spin_lock_irqsave(&prtd->lock, flags);
+	if (prtd->reset_pending) {
+		q6apm_compr_reset_counters(prtd);
+		prtd->reset_pending = false;
+		/* Preserve data pre-buffered after this reset across a peer flush. */
+		prtd->stop_reset = true;
+	}
+	spin_unlock_irqrestore(&prtd->lock, flags);
+
+	return 0;
+}
+
+static void q6apm_compr_error_work(struct work_struct *work)
+{
+	struct q6apm_dai_rtd *prtd = container_of(work, struct q6apm_dai_rtd,
+						 error_work);
+	struct snd_compr_stream *stream;
+	unsigned long flags;
+
+	spin_lock_irqsave(&prtd->lock, flags);
+	stream = prtd->closing ? NULL : prtd->cstream;
+	spin_unlock_irqrestore(&prtd->lock, flags);
+	if (!stream)
+		return;
+	guard(mutex)(&stream->device->lock);
+	snd_compr_stop_error(stream, SNDRV_PCM_STATE_XRUN);
+}
+
+static void q6apm_compr_report_error(struct q6apm_dai_rtd *prtd)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&prtd->lock, flags);
+	if (!prtd->closing)
+		schedule_work(&prtd->error_work);
+	spin_unlock_irqrestore(&prtd->lock, flags);
+}
+
+static void event_handler(uint32_t opcode, uint32_t token, uint32_t bytes,
+			  void *payload, void *priv)
 {
 	struct q6apm_dai_rtd *prtd = priv;
 	struct snd_pcm_substream *substream = prtd->substream;
+	int ret;
 
 	switch (opcode) {
 	case APM_CLIENT_EVENT_CMD_EOS_DONE:
 		prtd->state = Q6APM_STREAM_STOPPED;
 		break;
 	case APM_CLIENT_EVENT_DATA_WRITE_DONE:
+		if (!bytes) {
+			prtd->state = Q6APM_STREAM_STOPPED;
+			snd_pcm_stop_xrun(substream);
+			break;
+		}
 		snd_pcm_period_elapsed(substream);
 
 		break;
 	case APM_CLIENT_EVENT_DATA_READ_DONE:
+		if (!bytes) {
+			prtd->state = Q6APM_STREAM_STOPPED;
+			snd_pcm_stop_xrun(substream);
+			break;
+		}
 		snd_pcm_period_elapsed(substream);
-		if (prtd->state == Q6APM_STREAM_RUNNING)
-			q6apm_read(prtd->graph);
+		if (prtd->state == Q6APM_STREAM_RUNNING) {
+			ret = q6apm_read(prtd->graph);
+			if (ret) {
+				prtd->state = Q6APM_STREAM_STOPPED;
+				snd_pcm_stop_xrun(substream);
+				dev_err(prtd->graph->dev,
+					"capture refill failed: %d\n", ret);
+			}
+		}
 
 		break;
 	default:
@@ -147,60 +324,107 @@ static void event_handler(uint32_t opcode, uint32_t token, void *payload, void *
 }
 
 static void event_handler_compr(uint32_t opcode, uint32_t token,
-				void *payload, void *priv)
+				uint32_t bytes, void *payload, void *priv)
 {
 	struct q6apm_dai_rtd *prtd = priv;
 	struct snd_compr_stream *substream = prtd->cstream;
-	uint32_t wflags = 0;
-	uint64_t avail;
-	uint32_t bytes_written, bytes_to_write;
+	uint32_t wflags, bytes_to_write = 0;
+	unsigned long flags;
+	bool eos_now = false;
 	bool is_last_buffer = false;
+	bool send_eos = false;
+	bool notify_drain = false;
+	bool fragment_elapsed = false;
+	bool fatal_error = false;
+	int ret;
 
-	guard(spinlock_irqsave)(&prtd->lock);
+	spin_lock_irqsave(&prtd->lock, flags);
 	switch (opcode) {
 	case APM_CLIENT_EVENT_CMD_EOS_DONE:
-		if (prtd->notify_on_drain) {
-			snd_compr_drain_notify(prtd->cstream);
-			prtd->notify_on_drain = false;
+		if (prtd->drain_state != Q6APM_DRAIN_NONE) {
+			prtd->drain_state = Q6APM_DRAIN_NONE;
+			notify_drain = true;
 		} else {
 			prtd->state = Q6APM_STREAM_STOPPED;
 		}
 		break;
 	case APM_CLIENT_EVENT_DATA_WRITE_DONE:
-		bytes_written = token >> APM_WRITE_TOKEN_LEN_SHIFT;
-		prtd->copied_total += bytes_written;
-		snd_compr_fragment_elapsed(substream);
-
-		if (prtd->state != Q6APM_STREAM_RUNNING)
+		if (!bytes || prtd->bytes_sent < prtd->copied_total ||
+		    bytes > prtd->bytes_sent - prtd->copied_total) {
+			prtd->state = Q6APM_STREAM_STOPPED;
+			prtd->drain_state = Q6APM_DRAIN_NONE;
+			fatal_error = true;
 			break;
-
-		avail = prtd->bytes_received - prtd->bytes_sent;
-
-		if (avail > prtd->pcm_count) {
-			bytes_to_write = prtd->pcm_count;
-		} else {
-			if (substream->partial_drain || prtd->notify_on_drain)
-				is_last_buffer = true;
-			bytes_to_write = avail;
 		}
-
-		if (bytes_to_write) {
-			if (substream->partial_drain && is_last_buffer)
-				wflags |= APM_LAST_BUFFER_FLAG;
-
-			q6apm_write_async(prtd->graph,
-						bytes_to_write, 0, 0, wflags);
-
-			prtd->bytes_sent += bytes_to_write;
-
-			if (prtd->notify_on_drain && is_last_buffer)
-				audioreach_shared_memory_send_eos(prtd->graph);
-		}
-
+		prtd->copied_total += bytes;
+		fragment_elapsed = true;
+		bytes_to_write = q6apm_compr_reserve_next(prtd, &wflags,
+							  &is_last_buffer);
+		send_eos = prtd->drain_state == Q6APM_DRAIN_REQUESTED &&
+			is_last_buffer;
+		eos_now = prtd->drain_state == Q6APM_DRAIN_REQUESTED &&
+			!bytes_to_write &&
+			prtd->copied_total == prtd->bytes_received;
 		break;
 	default:
 		break;
 	}
+	spin_unlock_irqrestore(&prtd->lock, flags);
+
+	if (fatal_error)
+		q6apm_compr_report_error(prtd);
+	if (notify_drain)
+		snd_compr_drain_notify(prtd->cstream);
+	if (fragment_elapsed)
+		snd_compr_fragment_elapsed(substream);
+	if (bytes_to_write) {
+		ret = q6apm_compr_submit(prtd, bytes_to_write, wflags,
+					 send_eos);
+		if (ret)
+			dev_err(prtd->graph->dev,
+				"compressed write continuation failed: %d\n", ret);
+		if (ret)
+			q6apm_compr_report_error(prtd);
+	} else if (eos_now) {
+		ret = q6apm_compr_send_eos(prtd);
+		if (ret)
+			dev_err(prtd->graph->dev,
+				"compressed drain EOS failed: %d\n", ret);
+		if (ret)
+			q6apm_compr_report_error(prtd);
+	}
+}
+
+static int q6apm_dai_finish_pcm_reset(struct q6apm_dai_rtd *prtd)
+{
+	bool flush_ready = false;
+	int ret;
+
+	if (prtd->graph_started) {
+		WRITE_ONCE(prtd->state, Q6APM_STREAM_STOPPED);
+		q6apm_graph_quiesce_callbacks(prtd->graph);
+		ret = q6apm_graph_stop_with_state(prtd->graph, &flush_ready);
+		if (ret)
+			return ret;
+		prtd->graph_started = false;
+		prtd->reset_pending = true;
+	}
+
+	if (!prtd->reset_pending)
+		return 0;
+
+	if (flush_ready || q6apm_graph_request_flush(prtd->graph)) {
+		ret = q6apm_graph_flush(prtd->graph);
+		if (ret)
+			return ret;
+	} else {
+		q6apm_graph_sync_flush_generation(prtd->graph);
+		if (!q6apm_graph_try_reset_client(prtd->graph))
+			return -EBUSY;
+	}
+
+	prtd->reset_pending = false;
+	return 0;
 }
 
 static int q6apm_dai_prepare(struct snd_soc_component *component,
@@ -211,7 +435,7 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	struct audioreach_module_config cfg;
 	struct device *dev = component->dev;
 	struct q6apm_dai_data *pdata;
-	int ret;
+	int i, ret, reset_ret;
 
 	pdata = snd_soc_component_get_drvdata(component);
 	if (!pdata)
@@ -228,10 +452,12 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	cfg.bit_width = prtd->bits_per_sample;
 	cfg.fmt = SND_AUDIOCODEC_PCM;
 	audioreach_set_default_channel_mapping(cfg.channel_map, runtime->channels);
-	if (prtd->state) {
-		/* clear the previous setup if any  */
-		q6apm_graph_stop(prtd->graph);
+	ret = q6apm_dai_finish_pcm_reset(prtd);
+	if (ret)
+		return ret;
+	if (prtd->fragments_allocated) {
 		q6apm_free_fragments(prtd->graph, substream->stream);
+		prtd->fragments_allocated = false;
 	}
 
 	prtd->pcm_count = snd_pcm_lib_period_bytes(substream);
@@ -243,34 +469,43 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	}
 
 	ret = q6apm_graph_media_format_pcm(prtd->graph, &cfg);
-	if (ret < 0)
+	if (ret < 0) {
 		dev_err(dev, "%s: CMD Format block failed\n", __func__);
+		return ret;
+	}
 
 	ret = q6apm_alloc_fragments(prtd->graph, substream->stream, prtd->phys,
 				(prtd->pcm_size / prtd->periods), prtd->periods);
 
 	if (ret < 0) {
 		dev_err(dev, "Audio Start: Buffer Allocation failed rc = %d\n",	ret);
-		return -ENOMEM;
+		return ret;
 	}
+	prtd->fragments_allocated = true;
 
 	ret = q6apm_graph_prepare(prtd->graph);
 	if (ret) {
 		dev_err(dev, "Failed to prepare Graph %d\n", ret);
-		return ret;
+		goto free_fragments;
 	}
 
 	ret = q6apm_graph_start(prtd->graph);
 	if (ret) {
 		dev_err(dev, "Failed to Start Graph %d\n", ret);
-		return ret;
+		goto free_fragments;
 	}
+	prtd->graph_started = true;
 
 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
-		int i;
 		/* Queue the buffers for Capture ONLY after graph is started */
-		for (i = 0; i < runtime->periods; i++)
-			q6apm_read(prtd->graph);
+		for (i = 0; i < runtime->periods; i++) {
+			ret = q6apm_read(prtd->graph);
+			if (ret) {
+				dev_err(dev, "Failed to queue capture buffer %d: %d\n",
+					i, ret);
+				goto stop_graph;
+			}
+		}
 
 	}
 
@@ -278,6 +513,19 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	prtd->state = Q6APM_STREAM_RUNNING;
 
 	return 0;
+
+stop_graph:
+	prtd->state = Q6APM_STREAM_STOPPED;
+	reset_ret = q6apm_dai_finish_pcm_reset(prtd);
+	if (reset_ret) {
+		dev_err(dev, "Failed to quiesce graph during prepare rollback: %d\n",
+			reset_ret);
+		return ret;
+	}
+free_fragments:
+	q6apm_free_fragments(prtd->graph, substream->stream);
+	prtd->fragments_allocated = false;
+	return ret;
 }
 
 static int q6apm_dai_ack(struct snd_soc_component *component, struct snd_pcm_substream *substream)
@@ -404,6 +652,8 @@ static int q6apm_dai_open(struct snd_soc_component *component,
 
 	return 0;
 err:
+	if (!IS_ERR_OR_NULL(prtd->graph))
+		q6apm_graph_close(prtd->graph);
 	kfree(prtd);
 
 	return ret;
@@ -414,11 +664,23 @@ static int q6apm_dai_close(struct snd_soc_component *component,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
+	int ret;
 
-	if (prtd->state) {
-		/* only stop graph that is started */
-		q6apm_graph_stop(prtd->graph);
+	ret = q6apm_dai_finish_pcm_reset(prtd);
+	if (ret == -EBUSY) {
+		ret = q6apm_graph_wait_for_client_idle(prtd->graph, msecs_to_jiffies(10000));
+		if (!ret)
+			ret = q6apm_dai_finish_pcm_reset(prtd);
+	}
+	if (ret)
+		dev_err(component->dev,
+			"PCM DSP buffers did not quiesce; preserving DMA mapping: %d\n",
+			ret);
+	if (ret)
+		substream->dma_buffer.area = NULL;
+	if (prtd->fragments_allocated) {
 		q6apm_free_fragments(prtd->graph, substream->stream);
+		prtd->fragments_allocated = false;
 	}
 
 	q6apm_graph_close(prtd->graph);
@@ -554,11 +816,11 @@ static void q6apm_dai_pcm_free(struct snd_soc_component *component, struct snd_p
 	struct snd_pcm_substream *substream;
 
 	substream = pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
-	if (substream)
+	if (substream && substream->dma_buffer.area)
 		q6apm_dai_memory_unmap(component, substream);
 
 	substream = pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
-	if (substream)
+	if (substream && substream->dma_buffer.area)
 		q6apm_dai_memory_unmap(component, substream);
 }
 
@@ -584,31 +846,47 @@ static int q6apm_dai_compr_open(struct snd_soc_component *component,
 		return -ENOMEM;
 
 	prtd->cstream = stream;
+	spin_lock_init(&prtd->lock);
+	INIT_WORK(&prtd->error_work, q6apm_compr_error_work);
 	prtd->graph = q6apm_graph_open(dev, event_handler_compr, prtd, graph_id,
-					SNDRV_PCM_STREAM_PLAYBACK);
+						SNDRV_PCM_STREAM_PLAYBACK);
 	if (IS_ERR(prtd->graph)) {
 		ret = PTR_ERR(prtd->graph);
-		kfree(prtd);
-		return ret;
+		goto free_prtd;
 	}
 
-	runtime->private_data = prtd;
-	runtime->dma_bytes = BUFFER_BYTES_MAX;
 	size = COMPR_PLAYBACK_MAX_FRAGMENT_SIZE * COMPR_PLAYBACK_MAX_NUM_FRAGMENTS;
 	ret = snd_dma_alloc_pages(SNDRV_DMA_TYPE_DEV, dev, size, &prtd->dma_buffer);
 	if (ret)
-		return ret;
+		goto close_graph;
 
 	if (pdata->sid < 0)
 		prtd->phys = prtd->dma_buffer.addr;
 	else
 		prtd->phys = prtd->dma_buffer.addr | (pdata->sid << 32);
 
-	snd_compr_set_runtime_buffer(stream, &prtd->dma_buffer);
-	spin_lock_init(&prtd->lock);
+	ret = q6apm_map_memory_fixed_region(dev, graph_id, prtd->phys,
+					    prtd->dma_buffer.bytes);
+	if (ret)
+		goto free_dma;
 
-	q6apm_enable_compress_module(dev, prtd->graph, true);
+	ret = q6apm_enable_compress_module(dev, prtd->graph, true);
+	if (ret)
+		goto unmap_memory;
+
+	snd_compr_set_runtime_buffer(stream, &prtd->dma_buffer);
+	runtime->private_data = prtd;
 	return 0;
+
+unmap_memory:
+	q6apm_unmap_memory_fixed_region(dev, graph_id);
+free_dma:
+	snd_dma_free_pages(&prtd->dma_buffer);
+close_graph:
+	q6apm_graph_close(prtd->graph);
+free_prtd:
+	kfree(prtd);
+	return ret;
 }
 
 static int q6apm_dai_compr_free(struct snd_soc_component *component,
@@ -616,12 +894,60 @@ static int q6apm_dai_compr_free(struct snd_soc_component *component,
 {
 	struct snd_compr_runtime *runtime = stream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
+	bool flush_ready = false;
+	bool safe_to_free = true;
+	int ret;
+	unsigned long flags;
 
-	q6apm_graph_stop(prtd->graph);
-	q6apm_free_fragments(prtd->graph, SNDRV_PCM_STREAM_PLAYBACK);
-	q6apm_unmap_memory_fixed_region(component->dev, prtd->graph->id);
+	spin_lock_irqsave(&prtd->lock, flags);
+	prtd->closing = true;
+	spin_unlock_irqrestore(&prtd->lock, flags);
+	cancel_work_sync(&prtd->error_work);
+	cancel_delayed_work_sync(&stream->error_work);
+
+	if (prtd->graph_started) {
+		q6apm_graph_quiesce_callbacks(prtd->graph);
+		ret = q6apm_graph_stop_with_state(prtd->graph, &flush_ready);
+		if (!ret)
+			prtd->graph_started = false;
+		else
+			dev_warn(component->dev,
+				 "failed to stop compressed graph on close: %d\n", ret);
+	}
+	spin_lock_irqsave(&prtd->lock, flags);
+	prtd->reset_pending = true;
+	spin_unlock_irqrestore(&prtd->lock, flags);
+	ret = q6apm_compr_finish_stop_reset(prtd);
+	if (ret == -EBUSY && !prtd->graph_started)
+		flush_ready = q6apm_graph_request_flush(prtd->graph);
+	if (flush_ready) {
+		ret = q6apm_graph_flush(prtd->graph);
+		if (ret)
+			dev_warn(component->dev,
+				 "failed to flush compressed graph on close: %d\n", ret);
+	}
+	ret = q6apm_compr_finish_stop_reset(prtd);
+	if (ret == -EBUSY) {
+		ret = q6apm_graph_wait_for_client_idle(prtd->graph, msecs_to_jiffies(10000));
+		if (!ret)
+			ret = q6apm_compr_finish_stop_reset(prtd);
+	}
+	if (ret) {
+		/* Never recycle memory which the still-running DSP may own. */
+		safe_to_free = false;
+		dev_err(component->dev,
+			"compressed DSP buffers did not quiesce; preserving DMA mapping: %d\n",
+			ret);
+	}
+	if (prtd->fragments_allocated) {
+		q6apm_free_fragments(prtd->graph, SNDRV_PCM_STREAM_PLAYBACK);
+		prtd->fragments_allocated = false;
+	}
+	if (safe_to_free)
+		q6apm_unmap_memory_fixed_region(component->dev, prtd->graph->id);
 	q6apm_graph_close(prtd->graph);
-	snd_dma_free_pages(&prtd->dma_buffer);
+	if (safe_to_free)
+		snd_dma_free_pages(&prtd->dma_buffer);
 	prtd->graph = NULL;
 	kfree(prtd);
 	runtime->private_data = NULL;
@@ -679,29 +1005,140 @@ static int q6apm_dai_compr_pointer(struct snd_soc_component *component,
 }
 
 static int q6apm_dai_compr_trigger(struct snd_soc_component *component,
-			    struct snd_compr_stream *stream, int cmd)
+				    struct snd_compr_stream *stream, int cmd)
 {
 	struct snd_compr_runtime *runtime = stream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
-	int ret = 0;
+	uint32_t bytes_to_write = 0, wflags = 0;
+	unsigned long flags;
+	bool is_last_buffer = false;
+	bool send_eos = false;
+	bool graph_stopped = false;
+	bool generation_changed;
+	bool was_running;
+	int ret = 0, stop_ret;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		ret = q6apm_write_async(prtd->graph, prtd->pcm_count, 0, 0, NO_TIMESTAMP);
+		spin_lock_irqsave(&prtd->lock, flags);
+		was_running = prtd->graph_started;
+		spin_unlock_irqrestore(&prtd->lock, flags);
+		if (was_running)
+			break;
+		ret = q6apm_compr_finish_stop_reset(prtd);
+		if (ret)
+			break;
+
+		ret = q6apm_graph_start(prtd->graph);
+		if (ret)
+			break;
+		generation_changed =
+			q6apm_graph_sync_flush_generation(prtd->graph);
+		spin_lock_irqsave(&prtd->lock, flags);
+		if (generation_changed && !prtd->stop_reset) {
+			prtd->bytes_sent = 0;
+			prtd->bytes_received = 0;
+			prtd->copied_total = 0;
+			prtd->next_track = false;
+			prtd->drain_state = Q6APM_DRAIN_NONE;
+		}
+		prtd->stop_reset = false;
+		prtd->graph_started = true;
+		prtd->state = Q6APM_STREAM_RUNNING;
+		bytes_to_write = q6apm_compr_reserve_next(prtd, &wflags,
+							  &is_last_buffer);
+		send_eos = prtd->drain_state == Q6APM_DRAIN_REQUESTED &&
+			is_last_buffer;
+		spin_unlock_irqrestore(&prtd->lock, flags);
+		if (bytes_to_write) {
+			wflags |= NO_TIMESTAMP;
+			ret = q6apm_compr_submit(prtd, bytes_to_write, wflags,
+						 send_eos);
+			if (ret) {
+				stop_ret = q6apm_graph_stop_with_state(prtd->graph, &graph_stopped);
+				if (!stop_ret) {
+					spin_lock_irqsave(&prtd->lock, flags);
+					prtd->graph_started = false;
+					prtd->reset_pending = true;
+					spin_unlock_irqrestore(&prtd->lock, flags);
+					if (graph_stopped)
+						q6apm_graph_flush(prtd->graph);
+					q6apm_compr_finish_stop_reset(prtd);
+				}
+			}
+		}
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
-		break;
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		spin_lock_irqsave(&prtd->lock, flags);
+		was_running = prtd->graph_started;
+		prtd->state = Q6APM_STREAM_STOPPED;
+		if (cmd == SNDRV_PCM_TRIGGER_STOP)
+			prtd->drain_state = Q6APM_DRAIN_NONE;
+		spin_unlock_irqrestore(&prtd->lock, flags);
+		if (was_running) {
+			q6apm_graph_quiesce_callbacks(prtd->graph);
+			if (cmd == SNDRV_PCM_TRIGGER_STOP)
+				ret = q6apm_graph_stop_with_state(prtd->graph, &graph_stopped);
+			else
+				ret = q6apm_graph_stop(prtd->graph);
+			if (ret) {
+				spin_lock_irqsave(&prtd->lock, flags);
+				prtd->state = Q6APM_STREAM_RUNNING;
+				spin_unlock_irqrestore(&prtd->lock, flags);
+				break;
+			}
+			spin_lock_irqsave(&prtd->lock, flags);
+			prtd->graph_started = false;
+			spin_unlock_irqrestore(&prtd->lock, flags);
+		}
+		if (cmd == SNDRV_PCM_TRIGGER_STOP) {
+			spin_lock_irqsave(&prtd->lock, flags);
+			prtd->reset_pending = true;
+			spin_unlock_irqrestore(&prtd->lock, flags);
+			if (!was_running && !q6apm_compr_finish_stop_reset(prtd))
+				break;
+			if (!was_running)
+				graph_stopped = q6apm_graph_request_flush(prtd->graph);
+			if (graph_stopped) {
+				ret = q6apm_graph_flush(prtd->graph);
+				if (ret)
+					break;
+			}
+			/* Non-final STOP completes asynchronously with local DSP I/O. */
+			q6apm_compr_finish_stop_reset(prtd);
+		}
 		break;
 	case SND_COMPR_TRIGGER_NEXT_TRACK:
+		spin_lock_irqsave(&prtd->lock, flags);
 		prtd->next_track = true;
+		spin_unlock_irqrestore(&prtd->lock, flags);
 		break;
 	case SND_COMPR_TRIGGER_DRAIN:
 	case SND_COMPR_TRIGGER_PARTIAL_DRAIN:
-		prtd->notify_on_drain = true;
+		spin_lock_irqsave(&prtd->lock, flags);
+		if (prtd->state != Q6APM_STREAM_RUNNING) {
+			spin_unlock_irqrestore(&prtd->lock, flags);
+			return -EPERM;
+		}
+		if (prtd->drain_state != Q6APM_DRAIN_NONE) {
+			spin_unlock_irqrestore(&prtd->lock, flags);
+			return -EBUSY;
+		}
+		prtd->drain_state = Q6APM_DRAIN_REQUESTED;
+		bytes_to_write = q6apm_compr_reserve_next(prtd, &wflags,
+							  &is_last_buffer);
+		was_running = !bytes_to_write &&
+			prtd->copied_total == prtd->bytes_received;
+		spin_unlock_irqrestore(&prtd->lock, flags);
+		if (bytes_to_write)
+			ret = q6apm_compr_submit(prtd, bytes_to_write, wflags,
+						 is_last_buffer);
+		else if (was_running)
+			ret = q6apm_compr_send_eos(prtd);
 		break;
 	default:
 		ret = -EINVAL;
@@ -716,9 +1153,30 @@ static int q6apm_dai_compr_ack(struct snd_soc_component *component, struct snd_c
 {
 	struct snd_compr_runtime *runtime = stream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
+	uint32_t bytes_to_write, wflags;
+	unsigned long flags;
+	bool is_last_buffer;
+	bool send_eos;
+	int ret;
 
-	guard(spinlock_irqsave)(&prtd->lock);
+	ret = q6apm_compr_finish_stop_reset(prtd);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&prtd->lock, flags);
 	prtd->bytes_received += count;
+	bytes_to_write = q6apm_compr_reserve_next(prtd, &wflags,
+						  &is_last_buffer);
+	send_eos = prtd->drain_state == Q6APM_DRAIN_REQUESTED &&
+		is_last_buffer;
+	spin_unlock_irqrestore(&prtd->lock, flags);
+
+	if (bytes_to_write) {
+		ret = q6apm_compr_submit(prtd, bytes_to_write, wflags,
+					 send_eos);
+		if (ret)
+			return ret;
+	}
 
 	return count;
 }
@@ -738,6 +1196,9 @@ static int q6apm_dai_compr_set_params(struct snd_soc_component *component,
 	pdata = snd_soc_component_get_drvdata(component);
 	if (!pdata)
 		return -EINVAL;
+	ret = q6apm_compr_finish_stop_reset(prtd);
+	if (ret)
+		return ret;
 
 	prtd->periods = runtime->fragments;
 	prtd->pcm_count = runtime->fragment_size;
@@ -745,6 +1206,13 @@ static int q6apm_dai_compr_set_params(struct snd_soc_component *component,
 	prtd->bits_per_sample = 16;
 
 	if (prtd->next_track != true) {
+		if (prtd->graph_started)
+			return -EBUSY;
+		if (prtd->fragments_allocated) {
+			q6apm_free_fragments(prtd->graph,
+					     SNDRV_PCM_STREAM_PLAYBACK);
+			prtd->fragments_allocated = false;
+		}
 		memcpy(&prtd->codec, codec, sizeof(*codec));
 
 		ret = q6apm_set_real_module_id(component->dev, prtd->graph, codec->id);
@@ -772,16 +1240,18 @@ static int q6apm_dai_compr_set_params(struct snd_soc_component *component,
 					prtd->phys, (prtd->pcm_size / prtd->periods),
 					prtd->periods);
 		if (ret < 0)
-			return -ENOMEM;
+			return ret;
+		prtd->fragments_allocated = true;
 
 		ret = q6apm_graph_prepare(prtd->graph);
-		if (ret)
+		if (ret) {
+			q6apm_free_fragments(prtd->graph,
+					     SNDRV_PCM_STREAM_PLAYBACK);
+			prtd->fragments_allocated = false;
 			return ret;
+		}
 
-		ret = q6apm_graph_start(prtd->graph);
-		if (ret)
-			return ret;
-
+		prtd->state = Q6APM_STREAM_STOPPED;
 	} else {
 		cfg.direction = dir;
 		cfg.sample_rate = codec->sample_rate;
@@ -794,8 +1264,6 @@ static int q6apm_dai_compr_set_params(struct snd_soc_component *component,
 		if (ret < 0)
 			return ret;
 	}
-	prtd->state = Q6APM_STREAM_RUNNING;
-
 	return 0;
 }
 
@@ -809,12 +1277,12 @@ static int q6apm_dai_compr_set_metadata(struct snd_soc_component *component,
 
 	switch (metadata->key) {
 	case SNDRV_COMPRESS_ENCODER_PADDING:
-		q6apm_remove_trailing_silence(component->dev, prtd->graph,
-					      metadata->value[0]);
+		ret = q6apm_remove_trailing_silence(component->dev, prtd->graph,
+						    metadata->value[0]);
 		break;
 	case SNDRV_COMPRESS_ENCODER_DELAY:
-		q6apm_remove_initial_silence(component->dev, prtd->graph,
-					     metadata->value[0]);
+		ret = q6apm_remove_initial_silence(component->dev, prtd->graph,
+						   metadata->value[0]);
 		break;
 	default:
 		ret = -EINVAL;
@@ -844,12 +1312,21 @@ static int q6apm_compr_copy(struct snd_soc_component *component,
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
 	void *dstn;
 	size_t copy;
-	u32 wflags = 0;
+	u32 wflags = 0, bytes_to_write = 0;
 	u32 app_pointer;
+	unsigned long flags;
 	uint64_t bytes_received;
 	uint64_t temp_bytes_received;
-	uint32_t bytes_to_write;
-	uint64_t avail, bytes_in_flight = 0;
+	bool is_last_buffer = false;
+	bool send_eos = false;
+	int ret;
+
+	ret = q6apm_compr_finish_stop_reset(prtd);
+	if (ret)
+		return ret;
+
+	if (!prtd->pcm_size || count > prtd->pcm_size)
+		return -EINVAL;
 
 	bytes_received = prtd->bytes_received;
 	temp_bytes_received = bytes_received;
@@ -877,9 +1354,7 @@ static int q6apm_compr_copy(struct snd_soc_component *component,
 			return -EFAULT;
 	}
 
-	guard(spinlock_irqsave)(&prtd->lock);
-	bytes_in_flight = prtd->bytes_received - prtd->copied_total;
-
+	spin_lock_irqsave(&prtd->lock, flags);
 	if (prtd->next_track) {
 		prtd->next_track = false;
 		prtd->copied_total = ALIGN(prtd->copied_total, prtd->pcm_count);
@@ -889,15 +1364,16 @@ static int q6apm_compr_copy(struct snd_soc_component *component,
 	prtd->bytes_received = bytes_received + count;
 
 	/* Kick off the data to dsp if its starving!! */
-	if (prtd->state == Q6APM_STREAM_RUNNING && (bytes_in_flight == 0)) {
-		bytes_to_write = prtd->pcm_count;
-		avail = prtd->bytes_received - prtd->bytes_sent;
+	bytes_to_write = q6apm_compr_reserve_next(prtd, &wflags, &is_last_buffer);
+	send_eos = prtd->drain_state == Q6APM_DRAIN_REQUESTED &&
+		is_last_buffer;
+	spin_unlock_irqrestore(&prtd->lock, flags);
 
-		if (avail < prtd->pcm_count)
-			bytes_to_write = avail;
-
-		q6apm_write_async(prtd->graph, bytes_to_write, 0, 0, wflags);
-		prtd->bytes_sent += bytes_to_write;
+	if (bytes_to_write) {
+		ret = q6apm_compr_submit(prtd, bytes_to_write, wflags,
+					 send_eos);
+		if (ret)
+			return ret;
 	}
 
 	return count;

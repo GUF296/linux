@@ -47,10 +47,13 @@ enum wl2868c_regulator_id {
 };
 
 struct wl2868c {
+	struct device *dev;
 	struct regmap *regmap;
 	struct gpio_desc *enable_gpio;
 	struct regulator *supplies[WL2868C_NUM_SUPPLIES];
 	const struct wl2868c_chip *chip;
+	unsigned long supplies_enabled;
+	bool enable_gpio_asserted;
 };
 
 struct wl2868c_chip {
@@ -241,14 +244,17 @@ static int wl2868c_enable_supplies(struct device *dev, struct wl2868c *wl2868c)
 				wl2868c_supply_names[i], ret);
 			goto disable_supplies;
 		}
+		wl2868c->supplies_enabled |= BIT(i);
 	}
 
 	return 0;
 
 disable_supplies:
 	while (--i >= 0) {
-		if (wl2868c->supplies[i])
-			regulator_disable(wl2868c->supplies[i]);
+		if (wl2868c->supplies_enabled & BIT(i)) {
+			if (!regulator_disable(wl2868c->supplies[i]))
+				wl2868c->supplies_enabled &= ~BIT(i);
+		}
 	}
 
 	return ret;
@@ -256,12 +262,32 @@ disable_supplies:
 
 static void wl2868c_disable_supplies(struct wl2868c *wl2868c)
 {
-	int i;
+	int i, ret;
 
 	for (i = WL2868C_NUM_SUPPLIES - 1; i >= 0; i--) {
-		if (wl2868c->supplies[i])
-			regulator_disable(wl2868c->supplies[i]);
+		if (!(wl2868c->supplies_enabled & BIT(i)))
+			continue;
+
+		ret = regulator_disable(wl2868c->supplies[i]);
+		if (ret) {
+			dev_warn(wl2868c->dev, "failed to disable %s supply: %d\n",
+				 wl2868c_supply_names[i], ret);
+			continue;
+		}
+		wl2868c->supplies_enabled &= ~BIT(i);
 	}
+}
+
+static void wl2868c_power_off(void *data)
+{
+	struct wl2868c *wl2868c = data;
+
+	if (wl2868c->enable_gpio_asserted) {
+		gpiod_set_value_cansleep(wl2868c->enable_gpio, 0);
+		wl2868c->enable_gpio_asserted = false;
+	}
+
+	wl2868c_disable_supplies(wl2868c);
 }
 
 static int wl2868c_probe(struct i2c_client *client)
@@ -276,6 +302,7 @@ static int wl2868c_probe(struct i2c_client *client)
 	if (!wl2868c)
 		return -ENOMEM;
 
+	wl2868c->dev = dev;
 	wl2868c->chip = device_get_match_data(dev);
 	if (!wl2868c->chip)
 		wl2868c->chip = &wl2868c_chip;
@@ -295,15 +322,18 @@ static int wl2868c_probe(struct i2c_client *client)
 				    "failed to request enable gpio\n");
 		goto disable_supplies;
 	}
+	wl2868c->enable_gpio_asserted = !!wl2868c->enable_gpio;
+	ret = devm_add_action_or_reset(dev, wl2868c_power_off, wl2868c);
+	if (ret)
+		return ret;
 
 	if (wl2868c->enable_gpio)
 		usleep_range(20000, 25000);
 
 	wl2868c->regmap = devm_regmap_init_i2c(client, &wl2868c_regmap_config);
 	if (IS_ERR(wl2868c->regmap)) {
-		ret = dev_err_probe(dev, PTR_ERR(wl2868c->regmap),
-				    "failed to initialize regmap\n");
-		goto disable_gpio;
+		return dev_err_probe(dev, PTR_ERR(wl2868c->regmap),
+				     "failed to initialize regmap\n");
 	}
 
 	ret = wl2868c_read_with_retry(dev, wl2868c->regmap, 0x00, &id0);
@@ -330,11 +360,8 @@ static int wl2868c_probe(struct i2c_client *client)
 					&wl2868c->chip->regulators[i],
 					&config));
 		if (ret) {
-			dev_warn(dev,
-				 "failed to register ldo%d: %d; keeping power on for bus probe\n",
-				 i + 1, ret);
-			i2c_set_clientdata(client, wl2868c);
-			return 0;
+			return dev_err_probe(dev, ret,
+					     "failed to register ldo%d\n", i + 1);
 		}
 	}
 
@@ -342,27 +369,17 @@ static int wl2868c_probe(struct i2c_client *client)
 
 	return 0;
 
-disable_gpio:
-	if (wl2868c->enable_gpio)
-		gpiod_set_value_cansleep(wl2868c->enable_gpio, 0);
 disable_supplies:
 	wl2868c_disable_supplies(wl2868c);
-
-	if (ret)
-		return dev_err_probe(dev, ret, "probe failed\n");
-
-	return ret;
+	return dev_err_probe(dev, ret, "probe failed\n");
 }
 
 static void wl2868c_shutdown(struct i2c_client *client)
 {
 	struct wl2868c *wl2868c = i2c_get_clientdata(client);
 
-	if (wl2868c && wl2868c->enable_gpio)
-		gpiod_set_value_cansleep(wl2868c->enable_gpio, 0);
-
 	if (wl2868c)
-		wl2868c_disable_supplies(wl2868c);
+		wl2868c_power_off(wl2868c);
 }
 
 static const struct of_device_id wl2868c_of_match[] = {

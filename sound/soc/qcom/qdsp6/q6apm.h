@@ -7,12 +7,14 @@
 #include <linux/wait.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/rwsem.h>
 #include <linux/sched.h>
 #include <linux/of.h>
 #include <linux/delay.h>
 #include <sound/soc.h>
 #include <linux/of_platform.h>
 #include <linux/jiffies.h>
+#include <linux/kref.h>
 #include <linux/soc/qcom/apr.h>
 #include "../common.h"
 #include "audioreach.h"
@@ -41,15 +43,12 @@
 #define APM_CLIENT_EVENT_CMD_RUN_DONE		0x1008
 #define APM_CLIENT_EVENT_DATA_WRITE_DONE	0x1009
 #define APM_CLIENT_EVENT_DATA_READ_DONE		0x100a
-#define APM_WRITE_TOKEN_MASK                   GENMASK(15, 0)
-#define APM_WRITE_TOKEN_LEN_MASK               GENMASK(31, 16)
-#define APM_WRITE_TOKEN_LEN_SHIFT              16
-
 #define APM_MAX_SESSIONS			8
 #define APM_LAST_BUFFER_FLAG			BIT(30)
 #define NO_TIMESTAMP				0xFF00
 
 struct q6apm {
+	struct kref refcount;
 	struct device *dev;
 	gpr_port_t *port;
 	gpr_device_t *gdev;
@@ -57,9 +56,24 @@ struct q6apm {
 	wait_queue_head_t wait;
 	struct gpr_ibasic_rsp_result_t result;
 
+	/* Serializes online/offline transitions against in-flight commands. */
+	struct mutex online_lock;
 	struct mutex cmd_lock;
 	struct mutex lock;
+	struct mutex response_lock;
+	uint32_t pending_token;
+	uint32_t pending_opcode;
+	uint32_t pending_graph_id;
+	bool response_pending;
+	/* Pins topology data while cached graphs reference it. */
+	struct rw_semaphore graph_lock;
+	wait_queue_head_t graph_wait;
+	atomic_t active_graphs;
+	atomic_t graph_generation;
+	bool topology_deferred;
+	bool topology_remove_complete;
 	uint32_t state;
+	bool online;
 
 	struct list_head widget_list;
 	struct idr graph_idr;
@@ -72,6 +86,9 @@ struct q6apm {
 struct audio_buffer {
 	phys_addr_t phys;
 	uint32_t size;		/* size of buffer */
+	uint32_t submitted;	/* bytes in the current DSP transaction */
+	uint32_t token;
+	bool in_flight;
 };
 
 struct audioreach_graph_data {
@@ -89,11 +106,15 @@ struct audioreach_graph {
 	/* Cached Graph data */
 	void *graph;
 	struct kref refcount;
+	/* Protects graph start/stop reference state. */
+	struct mutex state_lock;
+	bool flush_pending;
+	u32 flush_generation;
 	struct q6apm *apm;
 };
 
 typedef void (*q6apm_cb) (uint32_t opcode, uint32_t token,
-			  void *payload, void *priv);
+				  uint32_t bytes, void *payload, void *priv);
 struct q6apm_graph {
 	void *priv;
 	q6apm_cb cb;
@@ -106,10 +127,23 @@ struct q6apm_graph {
 	struct audioreach_graph_data tx_data;
 	struct gpr_ibasic_rsp_result_t result;
 	wait_queue_head_t cmd_wait;
+	wait_queue_head_t data_wait;
 	struct mutex lock;
+	/* Serializes client callbacks against flush and buffer teardown. */
+	struct mutex callback_lock;
+	struct mutex response_lock;
+	uint32_t pending_cmd_token;
+	uint32_t pending_cmd_opcode;
+	uint32_t pending_eos_token;
+	u32 flush_generation;
+	bool command_pending;
+	bool eos_pending;
+	bool flushing;
 	struct audioreach_graph *ar_graph;
 	struct audioreach_graph_info *info;
 };
+
+uint32_t q6apm_next_token(void);
 
 /* Graph Operations */
 struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
@@ -118,7 +152,15 @@ int q6apm_graph_close(struct q6apm_graph *graph);
 int q6apm_graph_prepare(struct q6apm_graph *graph);
 int q6apm_graph_start(struct q6apm_graph *graph);
 int q6apm_graph_stop(struct q6apm_graph *graph);
+int q6apm_graph_stop_with_state(struct q6apm_graph *graph, bool *last);
+bool q6apm_graph_request_flush(struct q6apm_graph *graph);
 int q6apm_graph_flush(struct q6apm_graph *graph);
+bool q6apm_graph_sync_flush_generation(struct q6apm_graph *graph);
+void q6apm_graph_reset_client(struct q6apm_graph *graph);
+void q6apm_graph_quiesce_callbacks(struct q6apm_graph *graph);
+bool q6apm_graph_try_reset_client(struct q6apm_graph *graph);
+int q6apm_graph_wait_for_client_idle(struct q6apm_graph *graph,
+				     unsigned long timeout);
 
 /* Media Format */
 int q6apm_graph_media_format_pcm(struct q6apm_graph *graph,

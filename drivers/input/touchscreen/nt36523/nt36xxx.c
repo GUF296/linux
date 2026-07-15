@@ -61,8 +61,12 @@ static int nvt_drm_notifier_callback(struct notifier_block *self, unsigned long 
 
 static int32_t nvt_ts_suspend(struct device *dev);
 static int32_t nvt_ts_resume(struct device *dev);
+#if NVT_USE_MI_DRM_NOTIFIER
+static bool nvt_mi_notifier_registered;
+#endif
 #if defined(CONFIG_DRM_PANEL)
 static struct drm_panel_follower_funcs nt36xxx_panel_follower_funcs;
+static bool nvt_panel_follower_added;
 #endif
 
 uint32_t ENG_RST_ADDR  = 0x7FFF80;
@@ -77,7 +81,10 @@ const uint16_t touch_key_array[TOUCH_KEY_NUM] = {
 };
 #endif
 
-static uint8_t bTouchIsAwake = 0;
+static bool nvt_touch_awake;
+static bool nvt_irq_wake_enabled;
+static bool nvt_removing;
+static DEFINE_MUTEX(nvt_irq_wake_lock);
 
 #define NVT_Y700_ANDROID16_X_MAX	16000
 #define NVT_Y700_ANDROID16_Y_MAX	25600
@@ -113,6 +120,51 @@ static void nvt_irq_enable(bool enable)
 			ts->irq_enabled = false;
 		}
 	}
+}
+
+static int nvt_irq_wake_enable(bool enable)
+{
+	int ret;
+
+	if (ts->client->irq <= 0)
+		return -EINVAL;
+
+	mutex_lock(&nvt_irq_wake_lock);
+	if (enable) {
+		if (nvt_irq_wake_enabled) {
+			ret = 0;
+			goto unlock;
+		}
+		ret = enable_irq_wake(ts->client->irq);
+		if (!ret)
+			nvt_irq_wake_enabled = true;
+	} else {
+		if (!nvt_irq_wake_enabled) {
+			ret = 0;
+			goto unlock;
+		}
+		ret = disable_irq_wake(ts->client->irq);
+		if (!ret)
+			nvt_irq_wake_enabled = false;
+	}
+
+unlock:
+	mutex_unlock(&nvt_irq_wake_lock);
+	return ret;
+}
+
+static void nvt_recovery_failed(int ret)
+{
+	if (ts->irq_enabled) {
+		disable_irq_nosync(ts->client->irq);
+		ts->irq_enabled = false;
+	}
+#if NVT_TOUCH_ESD_PROTECT
+	esd_check = false;
+#endif
+	ts->ic_state = -EIO;
+	nvt_touch_awake = false;
+	NVT_ERR("firmware recovery failed (%d); touch IRQ remains disabled\n", ret);
 }
 
 static inline int32_t spi_read_write(struct spi_device *client, uint8_t *buf, size_t len , NVT_SPI_RW rw)
@@ -857,6 +909,10 @@ void nvt_esd_check_enable(uint8_t enable)
 static void nvt_esd_check_func(struct work_struct *work)
 {
 	unsigned int timer = jiffies_to_msecs(jiffies - irq_timer);
+	int ret;
+
+	if (READ_ONCE(nvt_removing))
+		return;
 
 	//NVT_LOG("esd_check = %d (retry %d)\n", esd_check, esd_retry);	//DEBUG
 
@@ -864,7 +920,14 @@ static void nvt_esd_check_func(struct work_struct *work)
 		mutex_lock(&ts->lock);
 		NVT_ERR("do ESD recovery, timer = %d, retry = %d\n", timer, esd_retry);
 		/* do esd recovery, reload fw */
-		nvt_update_firmware(ts->fw_name);
+		ret = nvt_update_firmware(ts->fw_name);
+		if (!ret)
+			ret = nvt_check_fw_reset_state(RESET_STATE_REK);
+		if (ret) {
+			nvt_recovery_failed(ret);
+			mutex_unlock(&ts->lock);
+			return;
+		}
 		mutex_unlock(&ts->lock);
 		/* update interrupt timer */
 		irq_timer = jiffies;
@@ -872,8 +935,9 @@ static void nvt_esd_check_func(struct work_struct *work)
 		esd_retry++;
 	}
 
-	queue_delayed_work(nvt_esd_check_wq, &nvt_esd_check_work,
-			msecs_to_jiffies(NVT_TOUCH_ESD_CHECK_PERIOD));
+	if (!READ_ONCE(nvt_removing))
+		queue_delayed_work(nvt_esd_check_wq, &nvt_esd_check_work,
+				   msecs_to_jiffies(NVT_TOUCH_ESD_CHECK_PERIOD));
 }
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 
@@ -1016,7 +1080,11 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 			NVT_ERR("Dump FW history:\n");
 			nvt_dump_fw_history();
 		}
-		nvt_update_firmware(ts->fw_name);
+		ret = nvt_update_firmware(ts->fw_name);
+		if (!ret)
+			ret = nvt_check_fw_reset_state(RESET_STATE_REK);
+		if (ret)
+			nvt_recovery_failed(ret);
 		goto XFER_ERROR;
 	}
 #endif /* #if NVT_TOUCH_WDT_RECOVERY */
@@ -1214,7 +1282,7 @@ static int32_t disable_pen_input_device(bool disable) {
 	int32_t ret = 0;
 
 	NVT_LOG("++\n");
-	if (!bTouchIsAwake || !ts) {
+	if (!nvt_touch_awake || !ts) {
 		NVT_LOG("touch suspend, stop set pen state %s", disable ? "DISABLE" : "ENABLE");
 		goto nvt_set_pen_enable_out;
 	}
@@ -1249,12 +1317,18 @@ nvt_set_pen_enable_out:
 static void nvt_suspend_work(struct work_struct *work)
 {
 	struct nvt_ts_data *ts_core = container_of(work, struct nvt_ts_data, suspend_work);
+
+	if (READ_ONCE(nvt_removing))
+		return;
 	nvt_ts_suspend(&ts_core->client->dev);
 }
 
 static void nvt_resume_work(struct work_struct *work)
 {
 	struct nvt_ts_data *ts_core = container_of(work, struct nvt_ts_data, resume_work);
+
+	if (READ_ONCE(nvt_removing))
+		return;
 	nvt_ts_resume(&ts_core->client->dev);
 }
 
@@ -1279,6 +1353,15 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		NVT_ERR("failed to allocated memory for nvt ts data\n");
 		return -ENOMEM;
 	}
+	nvt_removing = false;
+	nvt_irq_wake_enabled = false;
+	nvt_touch_awake = false;
+#if NVT_USE_MI_DRM_NOTIFIER
+	nvt_mi_notifier_registered = false;
+#endif
+#if defined(CONFIG_DRM_PANEL)
+	nvt_panel_follower_added = false;
+#endif
 
 	ts->xbuf = (uint8_t *)kzalloc((NVT_TRANSFER_LEN+1+DUMMY_BYTES), GFP_KERNEL);
 	if(ts->xbuf == NULL) {
@@ -1356,11 +1439,12 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 #if defined(CONFIG_DRM_PANEL)
 	if (drm_is_panel_follower(&client->dev)) {
 		ts->panel_follower.funcs = &nt36xxx_panel_follower_funcs;
-		ret = devm_drm_panel_add_follower(&client->dev, &ts->panel_follower);
+		ret = drm_panel_add_follower(&client->dev, &ts->panel_follower);
 		if (ret) {
 			NVT_ERR("panel follower setup failed. ret=%d\n", ret);
-			goto err_gpio_config_failed;
+			goto err_panelwait_failed;
 		}
+		nvt_panel_follower_added = true;
 	}
 #endif
 
@@ -1529,19 +1613,21 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	//---set int-pin & request irq---
 	client->irq = gpiod_to_irq(ts->irq_gpiod);
-	if (client->irq) {
-		NVT_LOG("int_trigger_type=%d\n", ts->int_trigger_type);
-		ts->irq_enabled = true;
-		ret = request_threaded_irq(client->irq, NULL, nvt_ts_work_func,
-				ts->int_trigger_type | IRQF_ONESHOT, NVT_SPI_NAME, ts);
-		if (ret != 0) {
-			NVT_ERR("request irq failed. ret=%d\n", ret);
-			goto err_int_request_failed;
-		} else {
-			nvt_irq_enable(false);
-			NVT_LOG("request irq %d succeed\n", client->irq);
-		}
+	if (client->irq <= 0) {
+		ret = client->irq ? client->irq : -EINVAL;
+		NVT_ERR("invalid touch IRQ: %d\n", client->irq);
+		goto err_int_request_failed;
 	}
+	NVT_LOG("int_trigger_type=%d\n", ts->int_trigger_type);
+	ret = request_threaded_irq(client->irq, NULL, nvt_ts_work_func,
+			ts->int_trigger_type | IRQF_ONESHOT, NVT_SPI_NAME, ts);
+	if (ret) {
+		NVT_ERR("request irq failed. ret=%d\n", ret);
+		goto err_int_request_failed;
+	}
+	ts->irq_enabled = true;
+	nvt_irq_enable(false);
+	NVT_LOG("request irq %d succeed\n", client->irq);
 
 	ts->pen_is_charge = false;
 
@@ -1562,8 +1648,10 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 #if BOOT_UPDATE_FIRMWARE
 	ret = nvt_update_firmware(ts->fw_name);
-	if (ret)
+	if (ret) {
 		NVT_ERR("download firmware failed\n");
+		goto err_free_irq;
+	}
 #endif
 
 	NVT_LOG("NVT_TOUCH_ESD_PROTECT is %d\n", NVT_TOUCH_ESD_PROTECT);
@@ -1596,23 +1684,34 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		NVT_ERR("register drm_notifier failed. ret=%d\n", ret);
 		goto err_register_drm_notif_failed;
 	}
+	nvt_mi_notifier_registered = true;
 #endif
 
-	bTouchIsAwake = 1;
+	nvt_touch_awake = true;
 	disable_pen_input_device(false);
 	NVT_LOG("end\n");
 
 	nvt_irq_enable(true);
+	pm_relax(&client->dev);
 
 	return 0;
 
 #if NVT_USE_MI_DRM_NOTIFIER
-	if (mi_drm_unregister_client(&ts->drm_notif))
-		NVT_ERR("Error occurred while unregistering drm_notifier.\n");
 err_register_drm_notif_failed:
+	if (nvt_mi_notifier_registered) {
+		if (mi_drm_unregister_client(&ts->drm_notif))
+			NVT_ERR("Error occurred while unregistering drm_notifier.\n");
+		nvt_mi_notifier_registered = false;
+	}
 #endif
 
 err_alloc_work_thread_failed:
+	if (ts->event_wq) {
+		cancel_work_sync(&ts->suspend_work);
+		cancel_work_sync(&ts->resume_work);
+		destroy_workqueue(ts->event_wq);
+		ts->event_wq = NULL;
+	}
 
 #if NVT_TOUCH_ESD_PROTECT
 	if (nvt_esd_check_wq) {
@@ -1622,7 +1721,10 @@ err_alloc_work_thread_failed:
 	}
 err_create_nvt_esd_check_wq_failed:
 #endif
-	free_irq(client->irq, ts);
+err_free_irq:
+	pm_relax(&client->dev);
+	if (client->irq > 0)
+		free_irq(client->irq, ts);
 err_int_request_failed:
 	if (ts->pen_support) {
 		input_unregister_device(ts->pen_input_dev);
@@ -1646,6 +1748,13 @@ err_input_register_device_failed:
 err_input_dev_alloc_failed:
 err_panelwait_failed:
 err_chipvertrim_failed:
+	WRITE_ONCE(nvt_removing, true);
+#if defined(CONFIG_DRM_PANEL)
+	if (nvt_panel_follower_added) {
+		drm_panel_remove_follower(&ts->panel_follower);
+		nvt_panel_follower_added = false;
+	}
+#endif
 	mutex_destroy(&ts->xbuf_lock);
 	mutex_destroy(&ts->lock);
 	nvt_gpio_deconfig(ts);
@@ -1680,11 +1789,34 @@ return:
 static void nvt_ts_remove(struct spi_device *client)
 {
 	NVT_LOG("Removing driver...\n");
+	if (!ts)
+		return;
+
+	WRITE_ONCE(nvt_removing, true);
+	nvt_touch_awake = false;
+	if (nvt_irq_wake_enable(false))
+		NVT_ERR("failed to disable IRQ wake during remove\n");
+#if defined(CONFIG_DRM_PANEL)
+	if (nvt_panel_follower_added) {
+		drm_panel_remove_follower(&ts->panel_follower);
+		nvt_panel_follower_added = false;
+	}
+#endif
 
 #if NVT_USE_MI_DRM_NOTIFIER
-	if (mi_drm_unregister_client(&ts->drm_notif))
-		NVT_ERR("Error occurred while unregistering drm_notifier.\n");
+	if (nvt_mi_notifier_registered) {
+		if (mi_drm_unregister_client(&ts->drm_notif))
+			NVT_ERR("Error occurred while unregistering drm_notifier.\n");
+		nvt_mi_notifier_registered = false;
+	}
 #endif
+
+	if (ts->event_wq) {
+		cancel_work_sync(&ts->suspend_work);
+		cancel_work_sync(&ts->resume_work);
+		destroy_workqueue(ts->event_wq);
+		ts->event_wq = NULL;
+	}
 
 #if NVT_TOUCH_ESD_PROTECT
 	if (nvt_esd_check_wq) {
@@ -1695,8 +1827,14 @@ static void nvt_ts_remove(struct spi_device *client)
 	}
 #endif
 
+	/* A suspend work already in flight may have re-enabled wake. */
+	if (nvt_irq_wake_enable(false))
+		NVT_ERR("failed to disable IRQ wake after work teardown\n");
+
 	nvt_irq_enable(false);
-	free_irq(client->irq, ts);
+	if (client->irq > 0)
+		free_irq(client->irq, ts);
+	pm_relax(&client->dev);
 
 	mutex_destroy(&ts->xbuf_lock);
 	mutex_destroy(&ts->lock);
@@ -1716,6 +1854,10 @@ static void nvt_ts_remove(struct spi_device *client)
 	}
 
 	spi_set_drvdata(client, NULL);
+	kfree(ts->rbuf);
+	ts->rbuf = NULL;
+	kfree(ts->xbuf);
+	ts->xbuf = NULL;
 
 	if (ts) {
 		kfree(ts);
@@ -1726,15 +1868,34 @@ static void nvt_ts_remove(struct spi_device *client)
 static void nvt_ts_shutdown(struct spi_device *client)
 {
 	NVT_LOG("Shutdown driver...\n");
+	if (!ts)
+		return;
 
-	nvt_irq_enable(false);
-
-#if NVT_USE_MI_DRM_NOTIFIER
-	if (mi_drm_unregister_client(&ts->drm_notif))
-		NVT_ERR("Error occurred while unregistering drm_notifier.\n");
+	WRITE_ONCE(nvt_removing, true);
+	nvt_touch_awake = false;
+	if (nvt_irq_wake_enable(false))
+		NVT_ERR("failed to disable IRQ wake during shutdown\n");
+#if defined(CONFIG_DRM_PANEL)
+	if (nvt_panel_follower_added) {
+		drm_panel_remove_follower(&ts->panel_follower);
+		nvt_panel_follower_added = false;
+	}
 #endif
 
-	destroy_workqueue(ts->event_wq);
+#if NVT_USE_MI_DRM_NOTIFIER
+	if (nvt_mi_notifier_registered) {
+		if (mi_drm_unregister_client(&ts->drm_notif))
+			NVT_ERR("Error occurred while unregistering drm_notifier.\n");
+		nvt_mi_notifier_registered = false;
+	}
+#endif
+
+	if (ts->event_wq) {
+		cancel_work_sync(&ts->suspend_work);
+		cancel_work_sync(&ts->resume_work);
+		destroy_workqueue(ts->event_wq);
+		ts->event_wq = NULL;
+	}
 
 #if NVT_TOUCH_ESD_PROTECT
 	if (nvt_esd_check_wq) {
@@ -1744,6 +1905,13 @@ static void nvt_ts_shutdown(struct spi_device *client)
 		nvt_esd_check_wq = NULL;
 	}
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
+
+	/* A suspend work already in flight may have re-enabled wake. */
+	if (nvt_irq_wake_enable(false))
+		NVT_ERR("failed to disable IRQ wake after work teardown\n");
+
+	nvt_irq_enable(false);
+	pm_relax(&client->dev);
 }
 
 /*******************************************************
@@ -1756,11 +1924,15 @@ return:
 static int32_t nvt_ts_suspend(struct device *dev)
 {
 	uint8_t buf[4] = {0};
+	int ret;
 #if MT_PROTOCOL_B
 	uint32_t i = 0;
 #endif
 
-	if (!bTouchIsAwake) {
+	if (READ_ONCE(nvt_removing))
+		return -ENODEV;
+
+	if (!nvt_touch_awake) {
 		NVT_LOG("Touch is already suspend\n");
 		return 0;
 	}
@@ -1790,7 +1962,7 @@ static int32_t nvt_ts_suspend(struct device *dev)
 		disable_pen_input_device(true);
 	}
 
-	bTouchIsAwake = 0;
+	nvt_touch_awake = false;
 
 	if (ts->db_wakeup) {
 		/*---write command to enter "wakeup gesture mode"---*/
@@ -1800,7 +1972,9 @@ static int32_t nvt_ts_suspend(struct device *dev)
 		buf[1] = 0x13;
 		CTP_SPI_WRITE(ts->client, buf, 2);
 		*/
-		enable_irq_wake(ts->client->irq);
+		ret = nvt_irq_wake_enable(true);
+		if (ret)
+			NVT_ERR("failed to enable touch IRQ wake: %d\n", ret);
 
 		NVT_LOG("Enabled touch wakeup gesture\n");
 	} else {
@@ -1850,13 +2024,25 @@ return:
 static int32_t nvt_ts_resume(struct device *dev)
 {
 	int ret = 0;
-	if (bTouchIsAwake) {
+	bool pm_suspended;
+
+	if (READ_ONCE(nvt_removing))
+		return -ENODEV;
+
+	if (nvt_touch_awake) {
 		NVT_LOG("Touch is already resume\n");
 		return 0;
 	}
 
-	if (ts->dev_pm_suspend)
+	pm_suspended = ts->dev_pm_suspend;
+	if (pm_suspended)
 		pm_stay_awake(dev);
+
+	ret = nvt_irq_wake_enable(false);
+	if (ret)
+		NVT_ERR("failed to disable touch IRQ wake before recovery: %d\n", ret);
+	if (ts->irq_enabled)
+		nvt_irq_enable(false);
 
 	mutex_lock(&ts->lock);
 
@@ -1868,13 +2054,15 @@ static int32_t nvt_ts_resume(struct device *dev)
 	gpiod_set_value_cansleep(ts->reset_gpiod, 1);
 #endif
 	ret = nvt_update_firmware(ts->fw_name);
-	if (ret)
+	if (ret) {
 		NVT_ERR("download firmware failed\n");
+		goto recovery_failed;
+	}
 
-	nvt_check_fw_reset_state(RESET_STATE_REK);
-
-	if (!ts->db_wakeup && !ts->irq_enabled) {
-		nvt_irq_enable(true);
+	ret = nvt_check_fw_reset_state(RESET_STATE_REK);
+	if (ret) {
+		NVT_ERR("firmware did not reach RESET_STATE_REK: %d\n", ret);
+		goto recovery_failed;
 	}
 
 #if NVT_TOUCH_ESD_PROTECT
@@ -1883,9 +2071,10 @@ static int32_t nvt_ts_resume(struct device *dev)
 			msecs_to_jiffies(NVT_TOUCH_ESD_CHECK_PERIOD));
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 
-	bTouchIsAwake = 1;
+	nvt_touch_awake = true;
 
 	mutex_unlock(&ts->lock);
+	nvt_irq_enable(true);
 
 	disable_pen_input_device(false);
 	if (likely(ts->ic_state == NVT_IC_RESUME_IN)) {
@@ -1899,22 +2088,33 @@ static int32_t nvt_ts_resume(struct device *dev)
 		NVT_LOG("execute delayed command, set double click wakeup %d\n", ts->db_wakeup);
 	}
 
-	if (ts->dev_pm_suspend)
+	if (pm_suspended)
 		pm_relax(dev);
 	NVT_LOG("end\n");
 
 	return 0;
+
+recovery_failed:
+	nvt_recovery_failed(ret);
+	mutex_unlock(&ts->lock);
+	if (pm_suspended)
+		pm_relax(dev);
+	return ret;
 }
 
 
 #if NVT_USE_MI_DRM_NOTIFIER
 static int nvt_drm_notifier_callback(struct notifier_block *self, unsigned long event, void *data)
 {
-	int blank = *(enum drm_notifier_data *)data;
+	int blank;
 	struct nvt_ts_data *ts_data =
 		container_of(self, struct nvt_ts_data, drm_notif);
 
-	if (data && ts_data) {
+	if (!data || !ts_data || READ_ONCE(nvt_removing))
+		return 0;
+
+	blank = *(enum drm_notifier_data *)data;
+	if (ts_data->event_wq) {
 		if (event == MI_DRM_EARLY_EVENT_BLANK) {
 			if (blank == MI_DRM_BLANK_POWERDOWN) {
 				NVT_LOG("event=%lu, *blank=%d\n", event, blank);
@@ -1936,9 +2136,16 @@ static int nvt_drm_notifier_callback(struct notifier_block *self, unsigned long 
 
 static int nvt_pm_suspend(struct device *dev)
 {
+	int ret;
+
+	if (READ_ONCE(nvt_removing))
+		return -ENODEV;
+
 	if (device_may_wakeup(dev) && ts->db_wakeup) {
 		NVT_LOG("enable touch irq wake\n");
-		enable_irq_wake(ts->client->irq);
+		ret = nvt_irq_wake_enable(true);
+		if (ret)
+			return ret;
 	}
 	ts->dev_pm_suspend = true;
 	reinit_completion(&ts->dev_pm_suspend_completion);
@@ -1948,14 +2155,18 @@ static int nvt_pm_suspend(struct device *dev)
 
 static int nvt_pm_resume(struct device *dev)
 {
+	int ret = 0;
+
 	if (device_may_wakeup(dev) && ts->db_wakeup) {
 		NVT_LOG("disable touch irq wake\n");
-		disable_irq_wake(ts->client->irq);
+		ret = nvt_irq_wake_enable(false);
+		if (ret)
+			NVT_ERR("failed to disable touch IRQ wake: %d\n", ret);
 	}
 	ts->dev_pm_suspend = false;
 	complete(&ts->dev_pm_suspend_completion);
 
-	return 0;
+	return ret;
 }
 
 static const struct dev_pm_ops nvt_dev_pm_ops = {
@@ -1969,6 +2180,8 @@ static int nt36xxx_panel_prepared(struct drm_panel_follower *follower)
 {
 	struct nvt_ts_data *ts = container_of(follower, struct nvt_ts_data,
 					      panel_follower);
+	if (READ_ONCE(nvt_removing))
+		return -ENODEV;
 
 	ts->panel_on = true;
 
@@ -1984,6 +2197,8 @@ static int nt36xxx_panel_unpreparing(struct drm_panel_follower *follower)
 {
 	struct nvt_ts_data *ts = container_of(follower, struct nvt_ts_data,
 					      panel_follower);
+	if (READ_ONCE(nvt_removing))
+		return -ENODEV;
 
 	ts->panel_on = false;
 

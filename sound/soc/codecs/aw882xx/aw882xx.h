@@ -189,6 +189,7 @@ struct aw882xx {
 
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *irq_gpio;
+	bool irq_requested;
 	unsigned char fw_status;
 	unsigned char fw_retry_cnt;
 	unsigned char rw_reg_addr;	/* rw attr node store read addr */

@@ -51,6 +51,7 @@ struct ktz8866 {
 	struct regmap *regmap;
 	bool led_on;
 	struct gpio_desc *enable_gpio;
+	unsigned int brightness;
 	unsigned int max_brightness;
 };
 
@@ -72,27 +73,73 @@ static int ktz8866_update_bits(struct ktz8866 *ktz, unsigned int reg,
 	return regmap_update_bits(ktz->regmap, reg, mask, val);
 }
 
+static void ktz8866_disable_gpio(void *data)
+{
+	struct ktz8866 *ktz = data;
+
+	if (ktz->enable_gpio)
+		gpiod_set_value_cansleep(ktz->enable_gpio, 0);
+}
+
 static int ktz8866_backlight_update_status(struct backlight_device *backlight_dev)
 {
 	struct ktz8866 *ktz = bl_get_data(backlight_dev);
 	unsigned int brightness = backlight_get_brightness(backlight_dev);
+	bool led_on = ktz->led_on;
+	int ret, rollback_ret;
 
 	if (!ktz->led_on && brightness > 0) {
-		ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT, BL_EN_BIT);
-		ktz->led_on = true;
+		ret = ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT, BL_EN_BIT);
+		if (ret)
+			return ret;
+		led_on = true;
 	} else if (brightness == 0) {
-		ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT, 0);
-		ktz->led_on = false;
+		ret = ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT, 0);
+		if (ret)
+			return ret;
+		led_on = false;
 	}
 
 	/* Set brightness */
 	if (brightness > ktz->max_brightness)
 		brightness = ktz->max_brightness;
 
-	ktz8866_write(ktz, BL_BRT_LSB, brightness & 0x7);
-	ktz8866_write(ktz, BL_BRT_MSB, (brightness >> 3) & 0xFF);
+	ret = ktz8866_write(ktz, BL_BRT_LSB, brightness & 0x7);
+	if (ret)
+		goto rollback_brightness;
+
+	ret = ktz8866_write(ktz, BL_BRT_MSB, (brightness >> 3) & 0xFF);
+	if (ret)
+		goto rollback_brightness;
+
+	ktz->led_on = led_on;
+	ktz->brightness = brightness;
 
 	return 0;
+
+rollback_brightness:
+	rollback_ret = ktz8866_write(ktz, BL_BRT_LSB,
+				     ktz->brightness & 0x7);
+	if (rollback_ret)
+		dev_warn(&ktz->client->dev,
+			 "failed to restore backlight brightness LSB: %d\n",
+			 rollback_ret);
+	rollback_ret = ktz8866_write(ktz, BL_BRT_MSB,
+				     (ktz->brightness >> 3) & 0xff);
+	if (rollback_ret)
+		dev_warn(&ktz->client->dev,
+			 "failed to restore backlight brightness MSB: %d\n",
+			 rollback_ret);
+	if (led_on != ktz->led_on) {
+		rollback_ret = ktz8866_update_bits(ktz, BL_EN, BL_EN_BIT,
+						   ktz->led_on ? BL_EN_BIT : 0);
+		if (rollback_ret)
+			dev_warn(&ktz->client->dev,
+				 "failed to restore backlight enable state: %d\n",
+				 rollback_ret);
+	}
+
+	return ret;
 }
 
 static const struct backlight_ops ktz8866_backlight_ops = {
@@ -100,47 +147,77 @@ static const struct backlight_ops ktz8866_backlight_ops = {
 	.update_status = ktz8866_backlight_update_status,
 };
 
-static void ktz8866_init(struct ktz8866 *ktz)
+static int ktz8866_init(struct ktz8866 *ktz)
 {
 	unsigned int val = 0;
+	int ret;
 
 	if (of_device_is_compatible(ktz->client->dev.of_node, "lenovo,ktz8866")) {
 		/*
 		 * Matches the vendor KTZ8866 bootstrap table:
 		 * 00=01, delay 10 ms, 02=da, 11=37, 15=68.
 		 */
-		ktz8866_write(ktz, SOFT_RESET, 0x01);
+		ret = ktz8866_write(ktz, SOFT_RESET, 0x01);
+		if (ret)
+			return ret;
 		usleep_range(10000, 11000);
-		ktz8866_write(ktz, BL_CFG1, 0xda);
-		ktz8866_write(ktz, BL_OPTION2, 0x37);
-		ktz8866_write(ktz, PWM_RAMP_TIME, 0x68);
+		ret = ktz8866_write(ktz, BL_CFG1, 0xda);
+		if (ret)
+			return ret;
+		ret = ktz8866_write(ktz, BL_OPTION2, 0x37);
+		if (ret)
+			return ret;
+		ret = ktz8866_write(ktz, PWM_RAMP_TIME, 0x68);
+		if (ret)
+			return ret;
 	}
 
-	if (!of_property_read_u32(ktz->client->dev.of_node, "current-num-sinks", &val))
-		ktz8866_write(ktz, BL_EN, BIT(val) - 1);
-	else
+	if (!of_property_read_u32(ktz->client->dev.of_node, "current-num-sinks", &val)) {
+		if (!val || val > 6)
+			return -EINVAL;
+		ret = ktz8866_write(ktz, BL_EN, BIT(val) - 1);
+	} else {
 		/* Enable all 6 current sinks if the number of current sinks isn't specified. */
-		ktz8866_write(ktz, BL_EN, BIT(6) - 1);
+		ret = ktz8866_write(ktz, BL_EN, BIT(6) - 1);
+	}
+	if (ret)
+		return ret;
 
 	if (!of_property_read_u32(ktz->client->dev.of_node, "kinetic,current-ramp-delay-ms", &val)) {
-		if (val <= 128)
-			ktz8866_write(ktz, BL_CFG2, BIT(7) | (ilog2(val) << 3) | PWM_HYST);
+		if (val && val <= 128 && is_power_of_2(val))
+			ret = ktz8866_write(ktz, BL_CFG2,
+					    BIT(7) | (ilog2(val) << 3) | PWM_HYST);
+		else if (val >= 192 && val <= 640 && !(val % 64))
+			ret = ktz8866_write(ktz, BL_CFG2,
+					    BIT(7) | ((5 + val / 64) << 3) | PWM_HYST);
 		else
-			ktz8866_write(ktz, BL_CFG2, BIT(7) | ((5 + val / 64) << 3) | PWM_HYST);
+			return -EINVAL;
+		if (ret)
+			return ret;
 	}
 
 	if (!of_property_read_u32(ktz->client->dev.of_node, "kinetic,led-enable-ramp-delay-ms", &val)) {
-		if (val == 0)
-			ktz8866_write(ktz, BL_DIMMING, 0);
-		else {
+		if (val == 0) {
+			ret = ktz8866_write(ktz, BL_DIMMING, 0);
+		} else if (val <= 16384 && is_power_of_2(val)) {
 			unsigned int ramp_off_time = ilog2(val) + 1;
 			unsigned int ramp_on_time = ramp_off_time << 4;
-			ktz8866_write(ktz, BL_DIMMING, ramp_on_time | ramp_off_time);
+			ret = ktz8866_write(ktz, BL_DIMMING,
+					    ramp_on_time | ramp_off_time);
+		} else {
+			return -EINVAL;
 		}
+		if (ret)
+			return ret;
 	}
 
-	if (of_property_read_bool(ktz->client->dev.of_node, "kinetic,enable-lcd-bias"))
-		ktz8866_write(ktz, LCD_BIAS_CFG1, LCD_BIAS_EN);
+	if (of_property_read_bool(ktz->client->dev.of_node, "kinetic,enable-lcd-bias")) {
+		ret = ktz8866_write(ktz, LCD_BIAS_CFG1, LCD_BIAS_EN);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int ktz8866_probe(struct i2c_client *client)
@@ -170,6 +247,11 @@ static int ktz8866_probe(struct i2c_client *client)
 	ktz->enable_gpio = devm_gpiod_get_optional(&client->dev, "enable", GPIOD_OUT_HIGH);
 	if (IS_ERR(ktz->enable_gpio))
 		return PTR_ERR(ktz->enable_gpio);
+
+	ret = devm_add_action_or_reset(&client->dev, ktz8866_disable_gpio, ktz);
+	if (ret)
+		return ret;
+
 	if (ktz->enable_gpio)
 		usleep_range(10000, 11000);
 
@@ -191,10 +273,16 @@ static int ktz8866_probe(struct i2c_client *client)
 		return dev_err_probe(&client->dev, PTR_ERR(backlight_dev),
 				"failed to register backlight device\n");
 
-	ktz8866_init(ktz);
+	ret = ktz8866_init(ktz);
+	if (ret)
+		return dev_err_probe(&client->dev, ret,
+				     "failed to initialize backlight controller\n");
 
 	i2c_set_clientdata(client, backlight_dev);
-	backlight_update_status(backlight_dev);
+	ret = backlight_update_status(backlight_dev);
+	if (ret)
+		return dev_err_probe(&client->dev, ret,
+				     "failed to set initial backlight state\n");
 
 	return 0;
 }
@@ -202,8 +290,12 @@ static int ktz8866_probe(struct i2c_client *client)
 static void ktz8866_remove(struct i2c_client *client)
 {
 	struct backlight_device *backlight_dev = i2c_get_clientdata(client);
+	int ret;
+
 	backlight_dev->props.brightness = 0;
-	backlight_update_status(backlight_dev);
+	ret = backlight_update_status(backlight_dev);
+	if (ret)
+		dev_warn(&client->dev, "failed to disable backlight: %d\n", ret);
 }
 
 static const struct i2c_device_id ktz8866_ids[] = {

@@ -6,6 +6,7 @@
 #include <linux/spinlock.h>
 #include <linux/device.h>
 #include <linux/mod_devicetable.h>
+#include <linux/wait.h>
 #include <dt-bindings/soc/qcom,apr.h>
 #include <dt-bindings/soc/qcom,gpr.h>
 
@@ -124,11 +125,24 @@ struct gpr_ibasic_rsp_accepted_t {
 
 typedef int (*gpr_port_cb) (const struct gpr_resp_pkt *d, void *priv, int op);
 struct packet_router;
+struct task_struct;
+enum pkt_router_svc_close_state {
+	PKT_ROUTER_SVC_LIVE,
+	PKT_ROUTER_SVC_CLOSING_EXTERNAL,
+	PKT_ROUTER_SVC_CLOSING_CALLBACK,
+};
+
 struct pkt_router_svc {
 	struct device *dev;
 	gpr_port_cb callback;
 	struct packet_router *pr;
 	spinlock_t lock;
+	atomic_t callback_users;
+	wait_queue_head_t callback_wait;
+	struct task_struct *callback_task;
+	enum pkt_router_svc_close_state close_state;
+	bool dynamic;
+	bool published;
 	int id;
 	void *priv;
 };

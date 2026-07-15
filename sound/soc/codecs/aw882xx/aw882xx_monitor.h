@@ -197,6 +197,7 @@ enum aw_monitor_mode {
  *******************************************************************/
 struct aw_monitor_desc {
 	struct delayed_work delay_work;
+	struct mutex lock;
 	struct aw_monitor_cfg monitor_cfg;
 
 	bool mon_start_flag;
@@ -221,7 +222,7 @@ struct aw_monitor_desc {
  *******************************************************************/
 void aw882xx_monitor_start(struct aw_monitor_desc *monitor_desc);
 int aw882xx_monitor_stop(struct aw_monitor_desc *monitor_desc);
-void aw882xx_monitor_init(struct aw_monitor_desc *monitor_desc);
+int aw882xx_monitor_init(struct aw_monitor_desc *monitor_desc);
 void aw882xx_monitor_deinit(struct aw_monitor_desc *monitor_desc);
 int aw882xx_monitor_parse_fw(struct aw_monitor_desc *monitor_desc,
 				uint8_t *data, uint32_t data_len);

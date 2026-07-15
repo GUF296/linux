@@ -29,6 +29,7 @@
 #include <sound/control.h>
 #include <linux/uaccess.h>
 #include <linux/miscdevice.h>
+#include <linux/compat.h>
 
 #include "aw882xx_log.h"
 #include "aw882xx_device.h"
@@ -49,10 +50,17 @@ static DEFINE_MUTEX(g_dev_lock);
 static const bool y700_bypass_iis_check;
 
 static DEFINE_MUTEX(g_algo_auth_dsp_lock);
-int g_algo_auth_st;
+static int g_algo_auth_st;
+
+void aw882xx_dev_algo_auth_reset(void)
+{
+	mutex_lock(&g_algo_auth_dsp_lock);
+	g_algo_auth_st = AW_ALGO_AUTH_WAIT;
+	mutex_unlock(&g_algo_auth_dsp_lock);
+}
 
 /*********************************algo auth*************************************/
-int aw882xx_dev_get_encrypted_value(struct aw_device *aw_dev,
+static int aw882xx_dev_get_encrypted_value(struct aw_device *aw_dev,
 			unsigned int in, unsigned int *out)
 {
 	int ret = 0;
@@ -76,30 +84,49 @@ int aw882xx_dev_algo_auth_mode(struct aw_device *aw_dev, struct algo_auth_data *
 {
 	int ret = 0;
 	unsigned int encrypted_out = 0;
+	unsigned int reg_crc;
 
+	mutex_lock(&aw_dev->auth_lock);
 	aw_dev_info(aw_dev->dev, "algo auth mode: %d", algo_data->auth_mode);
+
+	switch (algo_data->auth_mode) {
+	case AW_ALGO_AUTH_MODE_MAGIC_ID:
+		reg_crc = algo_data->reg_crc;
+		break;
+	case AW_ALGO_AUTH_MODE_REG_CRC:
+		ret = aw882xx_dev_get_encrypted_value(aw_dev, algo_data->random, &encrypted_out);
+		if (ret < 0) {
+			aw_dev_err(aw_dev->dev, "get encrypted value failed");
+			goto out;
+		}
+		reg_crc = encrypted_out;
+		break;
+	default:
+		aw_dev_err(aw_dev->dev, "unsupport auth mode[%d]", algo_data->auth_mode);
+		ret = -EINVAL;
+		goto out;
+	}
 
 	aw_dev->auth_desc.auth_mode = algo_data->auth_mode;
 	aw_dev->auth_desc.random = algo_data->random;
 	aw_dev->auth_desc.chip_id = AW_ALGO_AUTH_MAGIC_ID;
 	aw_dev->auth_desc.check_result = algo_data->check_result;
-
-	switch (algo_data->auth_mode) {
-	case AW_ALGO_AUTH_MODE_MAGIC_ID:
-		aw_dev->auth_desc.reg_crc = algo_data->reg_crc;
-		break;
-	case AW_ALGO_AUTH_MODE_REG_CRC:
-		ret = aw882xx_dev_get_encrypted_value(aw_dev, algo_data->random, &encrypted_out);
-		if (ret < 0)
-			aw_dev_err(aw_dev->dev, "get encrypted value failed");
-
-		aw_dev->auth_desc.reg_crc = encrypted_out;
-		break;
-	default:
-		aw_dev_err(aw_dev->dev, "unsupport auth mode[%d]", algo_data->auth_mode);
-		ret = -EINVAL;
-	}
+	aw_dev->auth_desc.reg_crc = reg_crc;
+out:
+	mutex_unlock(&aw_dev->auth_lock);
 	return ret;
+}
+
+void aw882xx_dev_get_algo_auth_data(struct aw_device *aw_dev,
+				    struct algo_auth_data *algo_data)
+{
+	mutex_lock(&aw_dev->auth_lock);
+	algo_data->auth_mode = aw_dev->auth_desc.auth_mode;
+	algo_data->chip_id = aw_dev->auth_desc.chip_id;
+	algo_data->random = aw_dev->auth_desc.random;
+	algo_data->reg_crc = aw_dev->auth_desc.reg_crc;
+	algo_data->check_result = aw_dev->auth_desc.check_result;
+	mutex_unlock(&aw_dev->auth_lock);
 }
 
 #ifdef AW_ALGO_AUTH_DSP
@@ -129,6 +156,7 @@ void aw882xx_dev_algo_authentication(struct aw_device *aw_dev)
 	struct algo_auth_data algo_data;
 
 	mutex_lock(&g_algo_auth_dsp_lock);
+	mutex_lock(&aw_dev->auth_lock);
 
 	aw_dev_dbg(aw_dev->dev, "g_algo_auth_st=%d", g_algo_auth_st);
 
@@ -157,6 +185,7 @@ void aw882xx_dev_algo_authentication(struct aw_device *aw_dev)
 		algo_data.chip_id, algo_data.check_result);
 
 exit:
+	mutex_unlock(&aw_dev->auth_lock);
 	mutex_unlock(&g_algo_auth_dsp_lock);
 }
 #endif
@@ -171,9 +200,9 @@ static int aw_algo_auth_misc_ops_write(struct aw_device *aw_dev,
 	aw_dev_dbg(aw_dev->dev, "write algo auth data, len=%d", data_len);
 
 	if (copy_from_user(&algo_data, (void __user *)arg, data_len))
-		ret = -EFAULT;
+		return -EFAULT;
 
-	aw882xx_dev_algo_auth_mode(aw_dev, &algo_data);
+	ret = aw882xx_dev_algo_auth_mode(aw_dev, &algo_data);
 
 	aw_dev_dbg(aw_dev->dev, "ret=%d,mode=%d,reg_crc=0x%x,random=0x%x,id=0x%x,res=%d",
 		ret, algo_data.auth_mode, algo_data.reg_crc, algo_data.random,
@@ -192,11 +221,7 @@ static int aw_algo_auth_misc_ops_read(struct aw_device *aw_dev,
 	aw_dev_dbg(aw_dev->dev, "read algo auth data, len=%d", data_len);
 	memset(&algo_data, 0x0, sizeof(struct algo_auth_data));
 
-	algo_data.auth_mode = aw_dev->auth_desc.auth_mode;
-	algo_data.chip_id = aw_dev->auth_desc.chip_id;
-	algo_data.random = aw_dev->auth_desc.random;
-	algo_data.reg_crc = aw_dev->auth_desc.reg_crc;
-	algo_data.check_result = aw_dev->auth_desc.check_result;
+	aw882xx_dev_get_algo_auth_data(aw_dev, &algo_data);
 
 	if (copy_to_user((void __user *)arg, (char *)&algo_data, data_len))
 		ret = -EFAULT;
@@ -230,80 +255,62 @@ static int aw_algo_auth_misc_ops(struct aw_device *aw_dev,
 }
 
 static long aw_algo_auth_misc_unlocked_ioctl(struct file *file,
-			unsigned int cmd, unsigned long arg)
+				unsigned int cmd, unsigned long arg)
 {
-	int ret = 0;
-	struct aw_device *aw_dev = NULL;
+	struct aw_device *aw_dev;
+	int ret;
 
 	if (((_IOC_TYPE(cmd)) != (AW_IOCTL_MAGIC_S))) {
 		aw_pr_err("cmd magic err");
 		return -EINVAL;
 	}
-	aw_dev = (struct aw_device *)file->private_data;
+	aw_dev = aw882xx_dev_get_by_channel(AW_DEV_CH_PRI_L);
+	if (!aw_dev)
+		return -ENODEV;
 	ret = aw_algo_auth_misc_ops(aw_dev, cmd, arg);
-	if (ret)
-		return -EINVAL;
+	aw882xx_dev_put(aw_dev);
 
-	return 0;
+	return ret;
 }
 
 #ifdef CONFIG_COMPAT
 static long aw_algo_auth_misc_compat_ioctl(struct file *file,
 	unsigned int cmd, unsigned long arg)
 {
-	int ret = 0;
-	struct aw_device *aw_dev = NULL;
+	struct aw_device *aw_dev;
+	int ret;
 
 	if (((_IOC_TYPE(cmd)) != (AW_IOCTL_MAGIC_S))) {
 		aw_pr_err("cmd magic err");
 		return -EINVAL;
 	}
-	aw_dev = (struct aw_device *)file->private_data;
-	ret = aw_algo_auth_misc_ops(aw_dev, cmd, arg);
-	if (ret)
-		return -EINVAL;
+	aw_dev = aw882xx_dev_get_by_channel(AW_DEV_CH_PRI_L);
+	if (!aw_dev)
+		return -ENODEV;
+	ret = aw_algo_auth_misc_ops(aw_dev, cmd,
+				    (unsigned long)compat_ptr(arg));
+	aw882xx_dev_put(aw_dev);
 
-	return 0;
+	return ret;
 }
 #endif
 
 static int aw_algo_auth_misc_open(struct inode *inode, struct file *file)
 {
-	int ret;
-	struct list_head *dev_list = NULL;
-	struct list_head *pos = NULL;
-	struct aw_device *local_dev = NULL;
+	struct aw_device *aw_dev;
 
-	ret = aw882xx_dev_get_list_head(&dev_list);
-	if (ret) {
-		aw_pr_err("get dev list failed");
-		file->private_data = NULL;
-		return -EINVAL;
-	}
+	aw_dev = aw882xx_dev_get_by_channel(AW_DEV_CH_PRI_L);
+	if (!aw_dev)
+		return -ENODEV;
 
-	/* find select dev */
-	list_for_each(pos, dev_list) {
-		local_dev = container_of(pos, struct aw_device, list_node);
-		if (local_dev->channel == 0)
-			break;
-	}
-
-	if (local_dev == NULL) {
-		aw_pr_err("can't find dev num %d", 0);
-		return -EINVAL;
-	}
-
-	file->private_data = (void *)local_dev;
-
-	aw_dev_dbg(local_dev->dev, "misc open success");
+	aw_dev_dbg(aw_dev->dev, "misc open success");
+	aw882xx_dev_put(aw_dev);
 	return 0;
 }
 
 
 static int aw_algo_auth_misc_release(struct inode *inode, struct file *file)
 {
-	file->private_data = (void *)NULL;
-
 	aw_pr_dbg("misc release success");
 	return 0;
 }
@@ -322,6 +329,7 @@ static struct miscdevice misc_algo_auth = {
 	.name = "awinic_ctl",
 	.minor = MISC_DYNAMIC_MINOR,
 	.fops  = &aw_algo_auth_misc_fops,
+	.mode = 0600,
 };
 
 static int aw882xx_algo_auth_misc_init(struct aw_device *aw_dev)
@@ -331,7 +339,7 @@ static int aw882xx_algo_auth_misc_init(struct aw_device *aw_dev)
 	ret = misc_register(&misc_algo_auth);
 	if (ret) {
 		aw_dev_err(aw_dev->dev, "misc register fail: %d\n", ret);
-		return -EINVAL;
+		return ret;
 	}
 
 	return 0;
@@ -1397,7 +1405,7 @@ static void aw_dev_boost_type_recover(struct aw_device *aw_dev)
 	}
 }
 
-void aw_dev_i2s_enable(struct aw_device *aw_dev, bool flag)
+static void aw_dev_i2s_enable(struct aw_device *aw_dev, bool flag)
 {
 	struct aw_txen_desc *txen_desc = &aw_dev->txen_desc;
 	struct aw_cali_desc *cali_desc = &aw_dev->cali_desc;
@@ -1594,9 +1602,6 @@ static int aw_device_parse_sound_channel_dt(struct aw_device *aw_dev)
 {
 	int ret = 0;
 	uint32_t channel_value = 0;
-	struct list_head *dev_list = NULL;
-	struct list_head *pos = NULL;
-	struct aw_device *local_dev = NULL;
 
 	ret = of_property_read_u32(aw_dev->dev->of_node, "sound-channel", &channel_value);
 	if (ret < 0) {
@@ -1608,31 +1613,13 @@ static int aw_device_parse_sound_channel_dt(struct aw_device *aw_dev)
 	if (channel_value >= AW_DEV_CH_MAX)
 		channel_value = AW_DEV_CH_PRI_L;
 
-	/* when dev_num > 0, get dev list to compare*/
-	if (aw_dev->ops.aw_get_dev_num() > 0) {
-		ret = aw882xx_dev_get_list_head(&dev_list);
-		if (ret) {
-			aw_dev_err(aw_dev->dev, "get dev list failed");
-			return ret;
-		}
-
-		list_for_each(pos, dev_list) {
-			local_dev = container_of(pos, struct aw_device, list_node);
-			if (local_dev->channel == channel_value) {
-				aw_dev_err(local_dev->dev, "sound-channel:%d already exists",
-					channel_value);
-				return -EINVAL;
-			}
-		}
-	}
-
 	aw_dev->channel = channel_value;
 
 	return 0;
 
 }
 
-void aw_device_parse_fade_flag_dt(struct aw_device *aw_dev)
+static void aw_device_parse_fade_flag_dt(struct aw_device *aw_dev)
 {
 	int ret;
 	uint32_t fade_en = 0;
@@ -1663,12 +1650,109 @@ static int aw_device_parse_dt(struct aw_device *aw_dev)
 	return ret;
 }
 
-int aw882xx_dev_get_list_head(struct list_head **head)
+int aw882xx_dev_get_list(struct aw_device_list *dev_list)
 {
-	if (list_empty(&g_dev_list))
+	struct aw_device *aw_dev;
+	unsigned int i;
+	int ret = 0;
+
+	if (!dev_list)
 		return -EINVAL;
 
-	*head = &g_dev_list;
+	dev_list->count = 0;
+	mutex_lock(&g_dev_lock);
+	list_for_each_entry(aw_dev, &g_dev_list, list_node) {
+		if (dev_list->count >= ARRAY_SIZE(dev_list->devices)) {
+			ret = -EOVERFLOW;
+			goto err_put;
+		}
+		if (!refcount_inc_not_zero(&aw_dev->users)) {
+			ret = -ENODEV;
+			goto err_put;
+		}
+		dev_list->devices[dev_list->count++] = aw_dev;
+	}
+	mutex_unlock(&g_dev_lock);
+
+	return dev_list->count ? 0 : -ENODEV;
+
+err_put:
+	for (i = 0; i < dev_list->count; i++)
+		refcount_dec(&dev_list->devices[i]->users);
+	dev_list->count = 0;
+	mutex_unlock(&g_dev_lock);
+	return ret;
+}
+
+void aw882xx_dev_put_list(struct aw_device_list *dev_list)
+{
+	unsigned int i;
+
+	if (WARN_ON(!dev_list))
+		return;
+
+	for (i = 0; i < dev_list->count; i++)
+		aw882xx_dev_put(dev_list->devices[i]);
+	dev_list->count = 0;
+}
+
+struct aw_device *aw882xx_dev_get_by_channel(unsigned int channel)
+{
+	struct aw_device *aw_dev;
+
+	mutex_lock(&g_dev_lock);
+	list_for_each_entry(aw_dev, &g_dev_list, list_node) {
+		if (aw_dev->channel == channel &&
+		    refcount_inc_not_zero(&aw_dev->users)) {
+			mutex_unlock(&g_dev_lock);
+			return aw_dev;
+		}
+	}
+	mutex_unlock(&g_dev_lock);
+
+	return NULL;
+}
+
+struct aw_device *aw882xx_dev_get_first(void)
+{
+	struct aw_device *aw_dev;
+
+	mutex_lock(&g_dev_lock);
+	if (list_empty(&g_dev_list)) {
+		mutex_unlock(&g_dev_lock);
+		return NULL;
+	}
+
+	aw_dev = list_first_entry(&g_dev_list, struct aw_device, list_node);
+	if (!refcount_inc_not_zero(&aw_dev->users)) {
+		mutex_unlock(&g_dev_lock);
+		return NULL;
+	}
+	mutex_unlock(&g_dev_lock);
+	return aw_dev;
+}
+
+void aw882xx_dev_put(struct aw_device *aw_dev)
+{
+	if (WARN_ON(!aw_dev))
+		return;
+	if (refcount_dec_and_test(&aw_dev->users))
+		complete(&aw_dev->users_done);
+}
+
+static int aw882xx_device_add(struct aw_device *aw_dev)
+{
+	struct aw_device *local_dev;
+
+	mutex_lock(&g_dev_lock);
+	list_for_each_entry(local_dev, &g_dev_list, list_node) {
+		if (local_dev->channel == aw_dev->channel) {
+			mutex_unlock(&g_dev_lock);
+			return -EEXIST;
+		}
+	}
+	list_add(&aw_dev->list_node, &g_dev_list);
+	mutex_unlock(&g_dev_lock);
 
 	return 0;
 }
@@ -1678,34 +1762,69 @@ int aw882xx_device_probe(struct aw_device *aw_dev)
 	int ret = 0;
 
 	INIT_LIST_HEAD(&aw_dev->list_node);
+	refcount_set(&aw_dev->users, 1);
+	init_completion(&aw_dev->users_done);
+	mutex_init(&aw_dev->auth_lock);
 
 	ret = aw_device_parse_dt(aw_dev);
 	if (ret)
 		return ret;
 
-	if (aw_dev->channel == 0)
-		aw882xx_algo_auth_misc_init(aw_dev);
+	if (aw_dev->channel == 0) {
+		ret = aw882xx_algo_auth_misc_init(aw_dev);
+		if (ret)
+			return ret;
+	}
 
 	ret = aw882xx_cali_init(&aw_dev->cali_desc);
 	if (ret)
-		return ret;
+		goto err_auth;
 
-	aw882xx_monitor_init(&aw_dev->monitor_desc);
+	ret = aw882xx_monitor_init(&aw_dev->monitor_desc);
+	if (ret)
+		goto err_cali;
 	/*aw_afe_init();*/
 
 	ret = aw882xx_spin_init(&aw_dev->spin_desc);
 	if (ret)
-		return ret;
+		goto err_monitor;
 
-	mutex_lock(&g_dev_lock);
-	list_add(&aw_dev->list_node, &g_dev_list);
-	mutex_unlock(&g_dev_lock);
+	ret = aw882xx_device_add(aw_dev);
+	if (ret)
+		goto err_monitor;
 
 	return 0;
+
+err_monitor:
+	aw882xx_monitor_deinit(&aw_dev->monitor_desc);
+err_cali:
+	aw882xx_cali_deinit(&aw_dev->cali_desc);
+err_auth:
+	if (aw_dev->channel == 0)
+		aw882xx_algo_auth_misc_deinit(aw_dev);
+	return ret;
+}
+
+void aw882xx_device_unpublish(struct aw_device *aw_dev)
+{
+	bool removed = false;
+
+	mutex_lock(&g_dev_lock);
+	if (!list_empty(&aw_dev->list_node)) {
+		list_del_init(&aw_dev->list_node);
+		removed = true;
+	}
+	mutex_unlock(&g_dev_lock);
+	if (removed) {
+		aw882xx_dev_put(aw_dev);
+		wait_for_completion(&aw_dev->users_done);
+	}
 }
 
 int aw882xx_device_remove(struct aw_device *aw_dev)
 {
+	aw882xx_device_unpublish(aw_dev);
+
 	aw882xx_monitor_deinit(&aw_dev->monitor_desc);
 	aw882xx_cali_deinit(&aw_dev->cali_desc);
 	if (aw_dev->channel == 0)

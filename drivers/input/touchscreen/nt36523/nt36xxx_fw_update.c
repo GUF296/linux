@@ -78,9 +78,9 @@ file checksum for comparison.
 return:
 	n.a.
 *******************************************************/
-static uint32_t CheckSum(const u8 *data, size_t len)
+static uint32_t nvt_checksum(const u8 *data, size_t len)
 {
-	uint32_t i = 0;
+	size_t i;
 	uint32_t checksum = 0;
 
 	for (i = 0 ; i < len+1 ; i++)
@@ -92,9 +92,33 @@ static uint32_t CheckSum(const u8 *data, size_t len)
 	return checksum;
 }
 
-static uint32_t byte_to_word(const uint8_t *data)
+static u32 byte_to_word(const u8 *data)
 {
-	return data[0] + (data[1] << 8) + (data[2] << 16) + (data[3] << 24);
+	return (u32)data[0] | ((u32)data[1] << 8) |
+	       ((u32)data[2] << 16) | ((u32)data[3] << 24);
+}
+
+static bool nvt_fw_range_valid(size_t fwsize, u32 offset, u32 len)
+{
+	return offset <= fwsize && len <= fwsize - offset;
+}
+
+static bool nvt_bin_map_valid(const struct nvt_ts_bin_map *map, size_t fwsize)
+{
+	u32 data_len;
+
+	/* A zero-sized entry is a reserved partition and is never written. */
+	if (!map->size)
+		return map->BIN_addr <= fwsize;
+
+	if (map->size == U32_MAX)
+		return false;
+
+	data_len = map->size + 1;
+	if (!nvt_fw_range_valid(fwsize, map->BIN_addr, data_len))
+		return false;
+
+	return map->SRAM_addr <= U32_MAX - map->size;
 }
 
 /*******************************************************
@@ -112,32 +136,46 @@ static int32_t nvt_bin_header_parser(const u8 *fwdata, size_t fwsize)
 	uint32_t list = 0;
 	uint32_t pos = 0x00;
 	uint32_t end = 0x00;
-	uint8_t info_sec_num = 0;
-	uint8_t ovly_sec_num = 0;
+	u32 info_sec_num = 0;
+	u32 ovly_sec_num = 0;
 	uint8_t ovly_info = 0;
 	uint8_t find_bin_header = 0;
+	u32 header_limit;
+	u32 overlay_index;
+	u32 bin_addr;
+	u32 data_len;
 
-	/* Find the header size */
-	end = fwdata[0] + (fwdata[1] << 8) + (fwdata[2] << 16) + (fwdata[3] << 24);
+	if (fwsize < 0x30) {
+		NVT_ERR("bin header is too small: %zu\n", fwsize);
+		return -EINVAL;
+	}
+
+	/* Find and validate the header size before reading fixed offsets. */
+	end = byte_to_word(fwdata);
+	if (end < 0x30 || end > fwsize) {
+		NVT_ERR("invalid header end 0x%08X for bin size %zu\n",
+			end, fwsize);
+		return -EINVAL;
+	}
 
 	/* check cascade next header */
 	cascade_2nd_header_info = (fwdata[0x20] & 0x02) >> 1;
 	NVT_LOG("cascade_2nd_header_info = %d\n", cascade_2nd_header_info);
 
 	if (cascade_2nd_header_info) {
-		pos = 0x30;	// info section start at 0x30 offset
-		while (pos < (end / 2)) {
-			info_sec_num ++;
-			pos += 0x10;	/* each header info is 16 bytes */
+		header_limit = end / 2;
+		if (header_limit < 0x30 || (header_limit - 0x30) % 0x10) {
+			NVT_ERR("invalid cascade header boundary 0x%08X\n",
+				header_limit);
+			return -EINVAL;
 		}
-
-		info_sec_num = info_sec_num + 1; //next header section
+		info_sec_num = (header_limit - 0x30) / 0x10 + 1;
 	} else {
-		pos = 0x30;	// info section start at 0x30 offset
-		while (pos < end) {
-			info_sec_num ++;
-			pos += 0x10;	/* each header info is 16 bytes */
+		if ((end - 0x30) % 0x10) {
+			NVT_ERR("unaligned header end 0x%08X\n", end);
+			return -EINVAL;
 		}
+		info_sec_num = (end - 0x30) / 0x10;
 	}
 
 	/*
@@ -148,119 +186,94 @@ static int32_t nvt_bin_header_parser(const u8 *fwdata, size_t fwsize)
 	ovly_info = (fwdata[0x28] & 0x10) >> 4;
 	ovly_sec_num = (ovly_info) ? (fwdata[0x28] & 0x0F) : 0;
 
-	/*
-	 * calculate all partition number
-	 * ilm_dlm_num (ILM & DLM) + ovly_sec_num + info_sec_num
-	 */
 	partition = ilm_dlm_num + ovly_sec_num + info_sec_num;
+	if (partition < ilm_dlm_num ||
+	    partition > NVT_TRANSFER_LEN / sizeof(uint32_t)) {
+		NVT_ERR("invalid partition count %u\n", partition);
+		return -EINVAL;
+	}
 	NVT_LOG("ovly_info = %d, ilm_dlm_num = %d, ovly_sec_num = %d, info_sec_num = %d, partition = %d\n",
 			ovly_info, ilm_dlm_num, ovly_sec_num, info_sec_num, partition);
 
-	/* allocated memory for header info */
-	bin_map = (struct nvt_ts_bin_map *)kzalloc((partition+1) * sizeof(struct nvt_ts_bin_map), GFP_KERNEL);
-	if(bin_map == NULL) {
-		NVT_ERR("kzalloc for bin_map failed!\n");
+	bin_map = kcalloc(partition, sizeof(*bin_map), GFP_KERNEL);
+	if (!bin_map) {
+		NVT_ERR("kcalloc for bin_map failed!\n");
 		return -ENOMEM;
 	}
 
 	for (list = 0; list < partition; list++) {
-		/*
-		 * [1] parsing ILM & DLM header info
-		 * BIN_addr : SRAM_addr : size (12-bytes)
-		 * crc located at 0x18 & 0x1C
-		 */
 		if (list < ilm_dlm_num) {
-			bin_map[list].BIN_addr = byte_to_word(&fwdata[0 + list*12]);
-			bin_map[list].SRAM_addr = byte_to_word(&fwdata[4 + list*12]);
-			bin_map[list].size = byte_to_word(&fwdata[8 + list*12]);
+			bin_map[list].BIN_addr = byte_to_word(&fwdata[list * 12]);
+			bin_map[list].SRAM_addr = byte_to_word(&fwdata[4 + list * 12]);
+			bin_map[list].size = byte_to_word(&fwdata[8 + list * 12]);
 			if (ts->hw_crc)
-				bin_map[list].crc = byte_to_word(&fwdata[0x18 + list*4]);
-			else { //ts->hw_crc
-				if ((bin_map[list].BIN_addr + bin_map[list].size) < fwsize)
-					bin_map[list].crc = CheckSum(&fwdata[bin_map[list].BIN_addr], bin_map[list].size);
-				else {
-					NVT_ERR("access range (0x%08X to 0x%08X) is larger than bin size!\n",
-							bin_map[list].BIN_addr, bin_map[list].BIN_addr + bin_map[list].size);
-					return -EINVAL;
-				}
-			} //ts->hw_crc
-			if (list == 0)
-				sprintf(bin_map[list].name, "ILM");
-			else if (list == 1)
-				sprintf(bin_map[list].name, "DLM");
+				bin_map[list].crc = byte_to_word(&fwdata[0x18 + list * 4]);
+			scnprintf(bin_map[list].name, sizeof(bin_map[list].name),
+				  list ? "DLM" : "ILM");
 		}
 
-		/*
-		 * [2] parsing others header info
-		 * SRAM_addr : size : BIN_addr : crc (16-bytes)
-		 */
-		if ((list >= ilm_dlm_num) && (list < (ilm_dlm_num + info_sec_num))) {
-			if (find_bin_header == 0) {
-				/* others partition located at 0x30 offset */
-				pos = 0x30 + (0x10 * (list - ilm_dlm_num));
-			} else if (find_bin_header && cascade_2nd_header_info) {
-				/* cascade 2nd header info */
+		if (list >= ilm_dlm_num &&
+		    list < ilm_dlm_num + info_sec_num) {
+			if (!find_bin_header)
+				pos = 0x30 + 0x10 * (list - ilm_dlm_num);
+			else if (cascade_2nd_header_info)
 				pos = end - 0x10;
+
+			if (!nvt_fw_range_valid(fwsize, pos, 0x10)) {
+				NVT_ERR("header entry at 0x%08X is outside bin\n", pos);
+				return -EINVAL;
 			}
 
 			bin_map[list].SRAM_addr = byte_to_word(&fwdata[pos]);
-			bin_map[list].size = byte_to_word(&fwdata[pos+4]);
-			bin_map[list].BIN_addr = byte_to_word(&fwdata[pos+8]);
+			bin_map[list].size = byte_to_word(&fwdata[pos + 4]);
+			bin_map[list].BIN_addr = byte_to_word(&fwdata[pos + 8]);
 			if (ts->hw_crc)
-				bin_map[list].crc = byte_to_word(&fwdata[pos+12]);
-			else { //ts->hw_crc
-				if ((bin_map[list].BIN_addr + bin_map[list].size) < fwsize)
-					bin_map[list].crc = CheckSum(&fwdata[bin_map[list].BIN_addr], bin_map[list].size);
-				else {
-					NVT_ERR("access range (0x%08X to 0x%08X) is larger than bin size!\n",
-							bin_map[list].BIN_addr, bin_map[list].BIN_addr + bin_map[list].size);
-					return -EINVAL;
-				}
-			} //ts->hw_crc
-			/* detect header end to protect parser function */
-			if ((bin_map[list].BIN_addr < end) && (bin_map[list].size != 0)) {
-				sprintf(bin_map[list].name, "Header");
+				bin_map[list].crc = byte_to_word(&fwdata[pos + 12]);
+
+			if (bin_map[list].BIN_addr < end && bin_map[list].size) {
+				scnprintf(bin_map[list].name,
+					  sizeof(bin_map[list].name), "Header");
 				find_bin_header = 1;
 			} else {
-				sprintf(bin_map[list].name, "Info-%d", (list - ilm_dlm_num));
+				scnprintf(bin_map[list].name,
+					  sizeof(bin_map[list].name), "Info-%u",
+					  list - ilm_dlm_num);
 			}
 		}
 
-		/*
-		 * [3] parsing overlay section header info
-		 * SRAM_addr : size : BIN_addr : crc (16-bytes)
-		 */
-		if (list >= (ilm_dlm_num + info_sec_num)) {
-			/* overlay info located at DLM (list = 1) start addr */
-			pos = bin_map[1].BIN_addr + (0x10 * (list- ilm_dlm_num - info_sec_num));
+		if (list >= ilm_dlm_num + info_sec_num) {
+			overlay_index = list - ilm_dlm_num - info_sec_num;
+			if (overlay_index > (U32_MAX - bin_map[1].BIN_addr) / 0x10) {
+				NVT_ERR("overlay header offset overflow\n");
+				return -EINVAL;
+			}
+			pos = bin_map[1].BIN_addr + 0x10 * overlay_index;
+			if (!nvt_fw_range_valid(fwsize, pos, 0x10)) {
+				NVT_ERR("overlay entry at 0x%08X is outside bin\n", pos);
+				return -EINVAL;
+			}
 
 			bin_map[list].SRAM_addr = byte_to_word(&fwdata[pos]);
-			bin_map[list].size = byte_to_word(&fwdata[pos+4]);
-			bin_map[list].BIN_addr = byte_to_word(&fwdata[pos+8]);
+			bin_map[list].size = byte_to_word(&fwdata[pos + 4]);
+			bin_map[list].BIN_addr = byte_to_word(&fwdata[pos + 8]);
 			if (ts->hw_crc)
-				bin_map[list].crc = byte_to_word(&fwdata[pos+12]);
-			else { //ts->hw_crc
-				if ((bin_map[list].BIN_addr + bin_map[list].size) < fwsize)
-					bin_map[list].crc = CheckSum(&fwdata[bin_map[list].BIN_addr], bin_map[list].size);
-				else {
-					NVT_ERR("access range (0x%08X to 0x%08X) is larger than bin size!\n",
-							bin_map[list].BIN_addr, bin_map[list].BIN_addr + bin_map[list].size);
-					return -EINVAL;
-				}
-			} //ts->hw_crc
-			sprintf(bin_map[list].name, "Overlay-%d", (list- ilm_dlm_num - info_sec_num));
+				bin_map[list].crc = byte_to_word(&fwdata[pos + 12]);
+			scnprintf(bin_map[list].name, sizeof(bin_map[list].name),
+				  "Overlay-%u", overlay_index);
 		}
 
-		/* BIN size error detect */
-		if ((bin_map[list].BIN_addr + bin_map[list].size) > fwsize) {
-			NVT_ERR("access range (0x%08X to 0x%08X) is larger than bin size!\n",
-					bin_map[list].BIN_addr, bin_map[list].BIN_addr + bin_map[list].size);
+		if (!nvt_bin_map_valid(&bin_map[list], fwsize)) {
+			NVT_ERR("invalid BIN/SRAM range: BIN=0x%08X size=0x%08X SRAM=0x%08X\n",
+				bin_map[list].BIN_addr, bin_map[list].size,
+				bin_map[list].SRAM_addr);
 			return -EINVAL;
 		}
 
-//		NVT_LOG("[%d][%s] SRAM (0x%08X), SIZE (0x%08X), BIN (0x%08X), CRC (0x%08X)\n",
-//				list, bin_map[list].name,
-//				bin_map[list].SRAM_addr, bin_map[list].size,  bin_map[list].BIN_addr, bin_map[list].crc);
+		if (!ts->hw_crc && bin_map[list].size) {
+			bin_addr = bin_map[list].BIN_addr;
+			data_len = bin_map[list].size;
+			bin_map[list].crc = nvt_checksum(fwdata + bin_addr, data_len);
+		}
 	}
 
 	return 0;
@@ -308,6 +321,14 @@ static int32_t update_firmware_request(const char *filename)
 		}
 
 		fw_need_write_size = fw_entry->size;
+
+		if (fw_need_write_size < SIZE_4KB ||
+		    fw_need_write_size > U32_MAX) {
+			NVT_ERR("unsupported firmware size: %zu\n",
+				fw_need_write_size);
+			ret = -ENOEXEC;
+			goto invalid;
+		}
 
 		// check if FW version add FW version bar equals 0xFF
 		if (*(fw_entry->data + FW_BIN_VER_OFFSET) + *(fw_entry->data + FW_BIN_VER_BAR_OFFSET) != 0xFF) {
@@ -388,9 +409,9 @@ static int32_t nvt_write_sram(const u8 *fwdata,
 			return ret;
 		}
 
-		SRAM_addr += NVT_TRANSFER_LEN;
-		BIN_addr += NVT_TRANSFER_LEN;
-		size -= NVT_TRANSFER_LEN;
+		SRAM_addr += len;
+		BIN_addr += len;
+		size -= len;
 	}
 
 	return ret;
@@ -424,9 +445,9 @@ static int32_t nvt_write_firmware(const u8 *fwdata, size_t fwsize)
 //				list, name, SRAM_addr, size, BIN_addr);
 
 		/* Check data size */
-		if ((BIN_addr + size) > fwsize) {
-			NVT_ERR("access range (0x%08X to 0x%08X) is larger than bin size!\n",
-					BIN_addr, BIN_addr + size);
+		if (!nvt_bin_map_valid(&bin_map[list], fwsize)) {
+			NVT_ERR("invalid partition range: BIN=0x%08X size=0x%08X SRAM=0x%08X\n",
+				BIN_addr, size, SRAM_addr);
 			ret = -EINVAL;
 			goto out;
 		}
