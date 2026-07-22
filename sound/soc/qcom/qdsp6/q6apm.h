@@ -15,6 +15,7 @@
 #include <linux/of_platform.h>
 #include <linux/jiffies.h>
 #include <linux/kref.h>
+#include <linux/workqueue.h>
 #include <linux/soc/qcom/apr.h>
 #include "../common.h"
 #include "audioreach.h"
@@ -113,6 +114,14 @@ struct audioreach_graph {
 	struct q6apm *apm;
 };
 
+/*
+ * Client callbacks run serialized from the GPR receive workqueue and may
+ * sleep.  @payload is owned by the receive packet and must not be retained;
+ * failed or malformed data completions may pass a NULL payload with zero
+ * bytes.  q6apm_graph_close() is permitted from a callback, but invalidates
+ * the graph handle immediately and defers destruction until the callback
+ * returns.
+ */
 typedef void (*q6apm_cb) (uint32_t opcode, uint32_t token,
 				  uint32_t bytes, void *payload, void *priv);
 struct q6apm_graph {
@@ -131,6 +140,12 @@ struct q6apm_graph {
 	struct mutex lock;
 	/* Serializes client callbacks against flush and buffer teardown. */
 	struct mutex callback_lock;
+	/* Serializes callback dispatch and close-state transitions. */
+	struct mutex lifecycle_lock;
+	struct task_struct *callback_task;
+	struct kref refcount;
+	struct work_struct close_work;
+	bool closing;
 	struct mutex response_lock;
 	uint32_t pending_cmd_token;
 	uint32_t pending_cmd_opcode;

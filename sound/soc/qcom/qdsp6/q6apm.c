@@ -695,6 +695,77 @@ static int q6apm_find_inflight_buffer(const struct audioreach_graph_data *data,
 	return -ENOENT;
 }
 
+static void q6apm_graph_release(struct kref *ref)
+{
+	struct q6apm_graph *graph = container_of(ref, struct q6apm_graph,
+					      refcount);
+
+	WARN_ON(graph->port);
+	WARN_ON(graph->ar_graph);
+	kfree(graph);
+}
+
+static void q6apm_graph_finish_close(struct q6apm_graph *graph)
+{
+	struct audioreach_graph *ar_graph;
+
+	mutex_lock(&graph->lock);
+	ar_graph = graph->ar_graph;
+	graph->ar_graph = NULL;
+	mutex_unlock(&graph->lock);
+
+	if (ar_graph)
+		kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);
+	kref_put(&graph->refcount, q6apm_graph_release);
+}
+
+static void q6apm_graph_close_work(struct work_struct *work)
+{
+	struct q6apm_graph *graph = container_of(work, struct q6apm_graph,
+					      close_work);
+
+	/* A callback-originated close must outlive the callback stack. */
+	mutex_lock(&graph->callback_lock);
+	mutex_unlock(&graph->callback_lock);
+	q6apm_graph_finish_close(graph);
+}
+
+static void q6apm_graph_call_client(struct q6apm_graph *graph,
+					  uint32_t opcode, uint32_t token,
+					  uint32_t bytes, void *payload)
+{
+	q6apm_cb cb;
+	void *priv;
+
+	lockdep_assert_held(&graph->callback_lock);
+
+	mutex_lock(&graph->lifecycle_lock);
+	if (graph->closing || !graph->cb) {
+		mutex_unlock(&graph->lifecycle_lock);
+		return;
+	}
+	graph->callback_task = current;
+	cb = graph->cb;
+	priv = graph->priv;
+	mutex_unlock(&graph->lifecycle_lock);
+
+	cb(opcode, token, bytes, payload, priv);
+
+	mutex_lock(&graph->lifecycle_lock);
+	if (graph->callback_task == current)
+		graph->callback_task = NULL;
+	mutex_unlock(&graph->lifecycle_lock);
+}
+
+static void q6apm_retire_inflight_buffer(struct audioreach_graph_data *data,
+					 int buffer)
+{
+	data->buf[buffer].submitted = 0;
+	data->buf[buffer].token = 0;
+	data->buf[buffer].in_flight = false;
+	atomic_set(&data->hw_ptr, buffer + 1);
+}
+
 static void q6apm_reset_graph_data(struct audioreach_graph_data *data)
 {
 	uint32_t i;
@@ -882,17 +953,12 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 	bool failed;
 	int buffer;
 
+	kref_get(&graph->refcount);
 	result = data->payload;
 
 	switch (hdr->opcode) {
 	case DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2:
-		if (data->payload_size < sizeof(*done)) {
-			dev_err(dev, "short write-done response: %d bytes\n",
-				data->payload_size);
-			break;
-		}
 		client_event = APM_CLIENT_EVENT_DATA_WRITE_DONE;
-		done = data->payload;
 		mutex_lock(&graph->callback_lock);
 		mutex_lock(&graph->lock);
 		if (!graph->ar_graph || !graph->rx_data.buf ||
@@ -910,6 +976,19 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 				hdr->token);
 			break;
 		}
+		if (data->payload_size < sizeof(*done)) {
+			/* The header token is still enough to retire this submission. */
+			dev_err(dev, "short write-done response: %d bytes\n",
+				data->payload_size);
+			q6apm_retire_inflight_buffer(&graph->rx_data, buffer);
+			mutex_unlock(&graph->lock);
+			wake_up_all(&graph->data_wait);
+			q6apm_graph_call_client(graph, client_event, buffer, 0,
+						NULL);
+			mutex_unlock(&graph->callback_lock);
+			break;
+		}
+		done = data->payload;
 		phys = graph->rx_data.buf[buffer].phys;
 		bytes = graph->rx_data.buf[buffer].submitted;
 		failed = !bytes || bytes > graph->rx_data.buf[buffer].size;
@@ -923,10 +1002,7 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 				done->buf_addr_msw);
 			failed = true;
 		}
-		graph->rx_data.buf[buffer].submitted = 0;
-		graph->rx_data.buf[buffer].token = 0;
-		graph->rx_data.buf[buffer].in_flight = false;
-		atomic_set(&graph->rx_data.hw_ptr, buffer + 1);
+		q6apm_retire_inflight_buffer(&graph->rx_data, buffer);
 		mutex_unlock(&graph->lock);
 		wake_up_all(&graph->data_wait);
 		if (failed || done->status) {
@@ -934,20 +1010,13 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 				buffer, done->status);
 			bytes = 0;
 		}
-		if (graph->cb)
-			graph->cb(client_event, buffer, bytes,
-				  data->payload, graph->priv);
+		q6apm_graph_call_client(graph, client_event, buffer, bytes,
+					data->payload);
 		mutex_unlock(&graph->callback_lock);
 
 		break;
 	case DATA_CMD_RSP_RD_SH_MEM_EP_DATA_BUFFER_V2:
-		if (data->payload_size < sizeof(*rd_done)) {
-			dev_err(dev, "short read-done response: %d bytes\n",
-				data->payload_size);
-			break;
-		}
 		client_event = APM_CLIENT_EVENT_DATA_READ_DONE;
-		rd_done = data->payload;
 		mutex_lock(&graph->callback_lock);
 		mutex_lock(&graph->lock);
 		if (!graph->ar_graph || !graph->tx_data.buf ||
@@ -965,6 +1034,19 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 				hdr->token);
 			break;
 		}
+		if (data->payload_size < sizeof(*rd_done)) {
+			/* The header token is still enough to retire this submission. */
+			dev_err(dev, "short read-done response: %d bytes\n",
+				data->payload_size);
+			q6apm_retire_inflight_buffer(&graph->tx_data, buffer);
+			mutex_unlock(&graph->lock);
+			wake_up_all(&graph->data_wait);
+			q6apm_graph_call_client(graph, client_event, buffer, 0,
+						NULL);
+			mutex_unlock(&graph->callback_lock);
+			break;
+		}
+		rd_done = data->payload;
 		phys = graph->tx_data.buf[buffer].phys;
 		failed = rd_done->data_size > graph->tx_data.buf[buffer].size;
 		if (failed) {
@@ -978,19 +1060,15 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 				rd_done->buf_addr_msw);
 			failed = true;
 		}
-		graph->tx_data.buf[buffer].submitted = 0;
-		graph->tx_data.buf[buffer].token = 0;
-		graph->tx_data.buf[buffer].in_flight = false;
-		atomic_set(&graph->tx_data.hw_ptr, buffer + 1);
+		q6apm_retire_inflight_buffer(&graph->tx_data, buffer);
 		mutex_unlock(&graph->lock);
 		wake_up_all(&graph->data_wait);
 		bytes = failed || rd_done->status ? 0 : rd_done->data_size;
 		if (failed || rd_done->status)
 			dev_err(dev, "read-done failed for token %d: %u\n",
 				buffer, rd_done->status);
-		if (graph->cb)
-			graph->cb(client_event, buffer, bytes,
-				  data->payload, graph->priv);
+		q6apm_graph_call_client(graph, client_event, buffer, bytes,
+					data->payload);
 		mutex_unlock(&graph->callback_lock);
 		break;
 	case DATA_CMD_WR_SH_MEM_EP_EOS_RENDERED:
@@ -1007,9 +1085,8 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 		graph->eos_pending = false;
 		mutex_unlock(&graph->lock);
 		wake_up_all(&graph->data_wait);
-		if (graph->cb)
-			graph->cb(client_event, hdr->token, 0,
-				  data->payload, graph->priv);
+		q6apm_graph_call_client(graph, client_event, hdr->token, 0,
+					data->payload);
 		mutex_unlock(&graph->callback_lock);
 		break;
 	case GPR_BASIC_RSP_RESULT:
@@ -1060,6 +1137,7 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 	default:
 		break;
 	}
+	kref_put(&graph->refcount, q6apm_graph_release);
 	return 0;
 }
 
@@ -1105,7 +1183,10 @@ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
 
 	mutex_init(&graph->lock);
 	mutex_init(&graph->callback_lock);
+	mutex_init(&graph->lifecycle_lock);
 	mutex_init(&graph->response_lock);
+	kref_init(&graph->refcount);
+	INIT_WORK(&graph->close_work, q6apm_graph_close_work);
 	init_waitqueue_head(&graph->cmd_wait);
 	init_waitqueue_head(&graph->data_wait);
 
@@ -1127,15 +1208,34 @@ EXPORT_SYMBOL_GPL(q6apm_graph_open);
 
 int q6apm_graph_close(struct q6apm_graph *graph)
 {
-	struct audioreach_graph *ar_graph = graph->ar_graph;
+	gpr_port_t *port;
+	bool defer_close;
 
-	gpr_free_port(graph->port);
+	mutex_lock(&graph->lifecycle_lock);
+	if (graph->closing) {
+		mutex_unlock(&graph->lifecycle_lock);
+		return 0;
+	}
+	graph->closing = true;
+	defer_close = graph->callback_task == current;
+	graph->cb = NULL;
+	graph->priv = NULL;
+	port = graph->port;
 	graph->port = NULL;
-	mutex_lock(&graph->lock);
-	graph->ar_graph = NULL;
-	mutex_unlock(&graph->lock);
-	kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);
-	kfree(graph);
+	mutex_unlock(&graph->lifecycle_lock);
+
+	if (port)
+		gpr_free_port(port);
+
+	if (defer_close) {
+		WARN_ON_ONCE(!schedule_work(&graph->close_work));
+		return 0;
+	}
+
+	/* Wait for non-GPR users of callback_lock before releasing graph state. */
+	mutex_lock(&graph->callback_lock);
+	mutex_unlock(&graph->callback_lock);
+	q6apm_graph_finish_close(graph);
 
 	return 0;
 }
