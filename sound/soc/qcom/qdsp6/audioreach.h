@@ -792,11 +792,6 @@ struct audioreach_connection {
 
 struct audioreach_graph_info {
 	int id;
-	uint32_t mem_map_handle;
-	struct mutex mem_map_lock;
-	phys_addr_t mem_map_phys;
-	size_t mem_map_size;
-	unsigned int mem_map_users;
 	uint32_t num_sub_graphs;
 	struct list_head sg_list;
 	/* DPCM connection from FE Graph to BE graph */

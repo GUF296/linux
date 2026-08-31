@@ -359,6 +359,16 @@
 	};
 };
 
+&reserved_memory {
+	ramoops@a2000000 {
+		compatible = "ramoops";
+		reg = <0x0 0xa2000000 0x0 0x400000>;
+		console-size = <0x200000>;
+		pmsg-size = <0x200000>;
+		no-map;
+	};
+};
+
 &apps_rsc {
 	regulators-0 {
 		compatible = "qcom,pm8550-rpmh-regulators";

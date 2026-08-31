@@ -55,17 +55,6 @@ struct y700_ss_reg_list {
 #include "sc202cs-y700-regs.h"
 #include "sc820cs-y700-regs.h"
 
-static const struct cci_reg_sequence sc202cs_y700_stream_on_regs[] = {
-	{ CCI_REG8(0x0100), 0x00 },
-	{ CCI_REG8(0x4501), 0xa4 },
-	{ CCI_REG8(0x391d), 0x03 },
-	{ CCI_REG8(0x3902), 0xc0 },
-	{ CCI_REG8(0x3909), 0x00 },
-	{ CCI_REG8(0x390a), 0x00 },
-	{ CCI_REG8(0x3908), 0x41 },
-	{ CCI_REG8(0x0100), 0x01 },
-};
-
 static const struct cci_reg_sequence y700_ss_stream_on_regs[] = {
 	{ Y700_SS_STREAM_REG, 0x01 },
 };

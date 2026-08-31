@@ -680,26 +680,11 @@ EXPORT_SYMBOL_GPL(audioreach_send_cmd_sync);
 int audioreach_graph_send_cmd_sync(struct q6apm_graph *graph, const struct gpr_pkt *pkt,
 					   uint32_t rsp_opcode)
 {
-	struct gpr_pkt *tx_pkt = (struct gpr_pkt *)pkt;
-	int ret;
-
-	mutex_lock(&graph->lock);
-	mutex_lock(&graph->response_lock);
-	tx_pkt->hdr.token = q6apm_next_token();
-	graph->pending_cmd_token = tx_pkt->hdr.token;
-	graph->pending_cmd_opcode = tx_pkt->hdr.opcode;
-	graph->command_pending = true;
-	mutex_unlock(&graph->response_lock);
-
-	ret = audioreach_send_cmd_sync_locked(graph->dev, NULL, &graph->result,
-					      &graph->lock, graph->port,
-					      &graph->cmd_wait, pkt, rsp_opcode);
-	mutex_lock(&graph->response_lock);
-	graph->command_pending = false;
-	mutex_unlock(&graph->response_lock);
-	mutex_unlock(&graph->lock);
-
-	return ret;
+	/*
+	 * Keep this legacy entry point source-compatible, but use the same
+	 * authenticated graph-port transaction as all current callers.
+	 */
+	return q6apm_send_cmd_sync_graph_port(graph, pkt, rsp_opcode);
 }
 EXPORT_SYMBOL_GPL(audioreach_graph_send_cmd_sync);
 
@@ -756,7 +741,7 @@ static int audioreach_display_port_set_media_format(struct q6apm_graph *graph,
 	intf_cfg->cfg.mst_idx = 0;
 	intf_cfg->cfg.dptx_idx = cfg->dp_idx;
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 /* LPASS Codec DMA port Module Media Format Setup */
@@ -824,7 +809,7 @@ static int audioreach_codec_dma_set_media_format(struct q6apm_graph *graph,
 	param_data->param_size = pm_sz - APM_MODULE_PARAM_DATA_SIZE;
 	pm_cfg->power_mode.power_mode = 0;
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 int audioreach_send_u32_param(struct q6apm_graph *graph,
@@ -852,7 +837,7 @@ int audioreach_send_u32_param(struct q6apm_graph *graph,
 	param = p;
 	*param = param_val;
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 EXPORT_SYMBOL_GPL(audioreach_send_u32_param);
 
@@ -900,7 +885,7 @@ static int audioreach_set_module_config(struct q6apm_graph *graph,
 
 	memcpy(p, module->data->data, size);
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 static int audioreach_mfc_set_media_format(struct q6apm_graph *graph,
@@ -936,7 +921,7 @@ static int audioreach_mfc_set_media_format(struct q6apm_graph *graph,
 	for (i = 0; i < num_channels; i++)
 		media_format->channel_mapping[i] = cfg->channel_map[i];
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 static int audioreach_set_compr_media_format(struct media_format *media_fmt_hdr,
@@ -1117,7 +1102,7 @@ static int audioreach_i2s_set_media_format(struct q6apm_graph *graph,
 			if (y700_graph40_i2s_sink)
 				intf_cfg->cfg.ws_src = y700_intf_ws_src;
 
-			rc = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+			rc = q6apm_send_cmd_sync_graph(graph, pkt, 0);
 			if (rc)
 				return rc;
 	}
@@ -1145,7 +1130,7 @@ static int audioreach_i2s_set_media_format(struct q6apm_graph *graph,
 			hw_cfg->mf.num_channels = cfg->num_channels;
 			hw_cfg->mf.data_format = module->data_format;
 
-			rc = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+			rc = q6apm_send_cmd_sync_graph(graph, pkt, 0);
 			if (rc)
 				return rc;
 	}
@@ -1212,7 +1197,7 @@ static int audioreach_i2s_set_media_format(struct q6apm_graph *graph,
 		clk_cfg->cfg.clock_attri = CLOCK_ATTRIBUTE_COUPLE_NO;
 		clk_cfg->cfg.clock_root = CLOCK_ROOT_DEFAULT;
 
-			rc = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+			rc = q6apm_send_cmd_sync_graph(graph, pkt, 0);
 			if (rc)
 				return rc;
 	}
@@ -1236,7 +1221,7 @@ static int audioreach_i2s_set_media_format(struct q6apm_graph *graph,
 		param_data->param_size = fs_sz - APM_MODULE_PARAM_DATA_SIZE;
 		fs_cfg->frame_size_factor = frame_size_factor;
 
-			return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+			return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 		}
 	}
 
@@ -1267,7 +1252,7 @@ static int audioreach_tdm_send_hw_ep_mf(struct q6apm_graph *graph,
 	hw_cfg->mf.num_channels = cfg->num_channels;
 	hw_cfg->mf.data_format = module->data_format;
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 static int audioreach_tdm_send_intf(struct q6apm_graph *graph,
@@ -1318,7 +1303,7 @@ static int audioreach_tdm_send_intf(struct q6apm_graph *graph,
 	intf_cfg->cfg.ctrl_invert_sync_pulse = TDM_SYNC_NORMAL;
 	intf_cfg->cfg.ctrl_sync_data_delay = 0;
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 static int audioreach_tdm_send_lane(struct q6apm_graph *graph,
@@ -1345,7 +1330,7 @@ static int audioreach_tdm_send_lane(struct q6apm_graph *graph,
 	param_data->param_size = lane_sz - APM_MODULE_PARAM_DATA_SIZE;
 	lane_cfg->cfg.lane_mask = lane_mask;
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 static int audioreach_tdm_send_clk(struct q6apm_graph *graph,
@@ -1383,7 +1368,7 @@ static int audioreach_tdm_send_clk(struct q6apm_graph *graph,
 	clk_cfg->cfg.clock_attri = CLOCK_ATTRIBUTE_COUPLE_NO;
 	clk_cfg->cfg.clock_root = CLOCK_ROOT_DEFAULT;
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
@@ -1439,7 +1424,7 @@ static int audioreach_logging_set_media_format(struct q6apm_graph *graph,
 	cfg->log_tap_point_id = module->log_tap_point_id;
 	cfg->mode = module->log_mode;
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 static int audioreach_pcm_set_media_format(struct q6apm_graph *graph,
@@ -1486,7 +1471,7 @@ static int audioreach_pcm_set_media_format(struct q6apm_graph *graph,
 	media_cfg->bits_per_sample = mcfg->bit_width;
 	memcpy(media_cfg->channel_mapping, mcfg->channel_map, mcfg->num_channels);
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 static int audioreach_shmem_set_media_format(struct q6apm_graph *graph,
@@ -1544,7 +1529,7 @@ static int audioreach_shmem_set_media_format(struct q6apm_graph *graph,
 			return rc;
 	}
 
-	return audioreach_graph_send_cmd_sync(graph, pkt, 0);
+	return q6apm_send_cmd_sync_graph_port(graph, pkt, 0);
 }
 
 int audioreach_gain_set_vol_ctrl(struct q6apm *apm,
@@ -1593,7 +1578,7 @@ static int audioreach_gain_set(struct q6apm_graph *graph,
 
 	cfg->gain_cfg.gain = module->gain;
 
-	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	return q6apm_send_cmd_sync_graph(graph, pkt, 0);
 }
 
 static int audioreach_speaker_protection(struct q6apm_graph *graph,
@@ -1676,7 +1661,7 @@ static int audioreach_speaker_protection_vi(struct q6apm_graph *graph,
 
 	ex_cfg->cfg.factory_mode = 0;
 
-	rc = q6apm_send_cmd_sync(graph->apm, pkt, 0);
+	rc = q6apm_send_cmd_sync_graph(graph, pkt, 0);
 
 	kfree(pkt);
 
@@ -1830,6 +1815,8 @@ int audioreach_shared_memory_send_eos(struct q6apm_graph *graph)
 		graph->pending_eos_token = 0;
 		graph->eos_pending = false;
 		wake_up_all(&graph->data_wait);
+	} else {
+		ret = 0;
 	}
 
 unlock:

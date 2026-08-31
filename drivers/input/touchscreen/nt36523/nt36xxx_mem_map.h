@@ -332,7 +332,7 @@ struct nvt_ts_trim_id_table {
 	const struct nvt_ts_hw_info *hwinfo;
 };
 
-static const struct nvt_ts_trim_id_table trim_id_table[] = {
+static const struct nvt_ts_trim_id_table trim_id_table[] __maybe_unused = {
 	{.id = {0x20, 0xFF, 0xFF, 0x23, 0x65, 0x03}, .mask = {1, 0, 0, 1, 1, 1},
 		.mmap = &NT36523_memory_map,  .hwinfo = &NT36523_hw_info},
 	{.id = {0x0C, 0xFF, 0xFF, 0x23, 0x65, 0x03}, .mask = {1, 0, 0, 1, 1, 1},

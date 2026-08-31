@@ -47,7 +47,6 @@ static struct audioreach_graph_info *audioreach_tplg_alloc_graph_info(struct q6a
 		return ERR_PTR(-ENOMEM);
 
 	INIT_LIST_HEAD(&info->sg_list);
-	mutex_init(&info->mem_map_lock);
 
 	mutex_lock(&apm->lock);
 	ret = idr_alloc_u32(&apm->graph_info_idr, info, &graph_id, graph_id, GFP_KERNEL);
