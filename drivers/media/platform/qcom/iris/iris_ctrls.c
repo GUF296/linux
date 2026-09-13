@@ -112,6 +112,10 @@ static enum platform_inst_fw_cap_type iris_get_cap_id(u32 id)
 		return IR_TYPE;
 	case V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD:
 		return IR_PERIOD;
+	case V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE:
+		return DISPLAY_DELAY_ENABLE;
+	case V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY:
+		return DISPLAY_DELAY;
 	default:
 		return INST_FW_CAP_MAX;
 	}
@@ -213,6 +217,10 @@ static u32 iris_get_v4l2_id(enum platform_inst_fw_cap_type cap_id)
 		return V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE;
 	case IR_PERIOD:
 		return V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD;
+	case DISPLAY_DELAY_ENABLE:
+		return V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE;
+	case DISPLAY_DELAY:
+		return V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY;
 	default:
 		return 0;
 	}
