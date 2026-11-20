@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "sound/soc/qcom/qdsp6/q6apm-dai.c"
 AUDIOREACH_SOURCE = ROOT / "sound/soc/qcom/qdsp6/audioreach.c"
 Q6APM_SOURCE = ROOT / "sound/soc/qcom/qdsp6/q6apm.c"
+COMPRESS_CORE_SOURCE = ROOT / "sound/core/compress_offload.c"
 U64_MAX = (1 << 64) - 1
 MIN_FRAGMENT_SIZE = 8 * 1024
 MAX_FRAGMENT_SIZE = 128 * 1024
@@ -172,8 +173,25 @@ def verify(source: str, audioreach: str, q6apm: str) -> list[str]:
     cleanup_cancel = function_body(source, "q6apm_compr_cancel_cleanup_work")
     if "cancel_work_sync(&prtd->error_work)" not in error_cancel:
         errors.append("free must synchronously cancel deferred error work")
-    if "cancel_delayed_work_sync(&prtd->drain_work)" not in drain_cancel:
-        errors.append("free must synchronously cancel deferred drain work")
+    drain_put = "q6apm_compr_work_put(prtd, &prtd->drain_work_queued);"
+    if not ordered(
+        drain_cancel, "cancelled = cancel_delayed_work_sync(&prtd->drain_work);",
+        "if (cancelled)", drain_put,
+    ) or drain_cancel.count(drain_put) != 1:
+        errors.append("only cancellation of pending drain work transfers its work claim")
+    queue_drain = function_body(source, "q6apm_compr_queue_drain_work")
+    if not ordered(
+        queue_drain, "spin_lock_irqsave(", "if (!prtd->closing && !prtd->drain_work_queued)",
+        "prtd->drain_work_queued = true;", "kref_get(&prtd->refcount);", "queue = true;",
+        "spin_unlock_irqrestore(", "if (queue)", "schedule_delayed_work(&prtd->drain_work, delay);",
+    ) or queue_drain.count("kref_get(") != 1:
+        errors.append("drain work must claim one reference before its first enqueue")
+    work_put = function_body(source, "q6apm_compr_work_put")
+    if not ordered(
+        work_put, "spin_lock_irqsave(", "if (*queued)", "*queued = false;", "drop = true;",
+        "spin_unlock_irqrestore(", "if (drop)", "q6apm_dai_rtd_put(prtd);",
+    ) or work_put.count("q6apm_dai_rtd_put(") != 1:
+        errors.append("the claimed work reference must be released exactly once")
     if "cancel_delayed_work_sync(&prtd->cleanup_work)" not in cleanup_cancel:
         errors.append("free must synchronously cancel quarantine cleanup work")
 
@@ -433,6 +451,24 @@ def verify(source: str, audioreach: str, q6apm: str) -> list[str]:
         "schedule_delayed_work(&prtd->drain_work, 1)",
     ):
         errors.append("early drain completion must remain pending until DRAINING")
+    notify_branch = drain_work.split("if (notify) {", 1)[-1].split(
+        "} else if (retry)", 1
+    )[0]
+    if notify_branch.count(drain_put) != 1 or not ordered(
+        notify_branch, "snd_compr_drain_notify(stream);", drain_put
+    ):
+        errors.append("successful drain must retire its queued claim and kref once")
+    elif "prtd" in notify_branch.split(drain_put, 1)[1]:
+        errors.append("successful drain must not access prtd after its final work put")
+    if not ordered(
+        drain_work, "stream = prtd->closing ? NULL : prtd->cstream;", "if (!stream)",
+        drain_put, "return;", "guard(mutex)(&stream->device->lock);",
+        "pending = !prtd->closing && prtd->drain_notify_pending &&",
+        "if (!prtd->closing && prtd->drain_notify_pending)",
+        "schedule_delayed_work(&prtd->drain_work, 1);", "rescheduled = true;",
+        "if (!rescheduled)", drain_put,
+    ) or drain_work.count(drain_put) != 4:
+        errors.append("drain retry retains its original claim and closing retires it")
 
     schedule_drain = function_body(source, "q6apm_compr_schedule_drain_notify")
     if "!prtd->error_pending" not in schedule_drain:
@@ -1083,6 +1119,37 @@ def verify(source: str, audioreach: str, q6apm: str) -> list[str]:
     ):
         errors.append("transport removal must detach tickets before releasing them")
 
+    graph_get = function_body(q6apm, "q6apm_graph_get_ar_graph")
+    if not ordered(
+        graph_get,
+        "available = !ar_graph->destroying",
+        "mutex_unlock(&ar_graph->state_lock)",
+        "if (!available)",
+        "ar_graph = NULL",
+    ):
+        errors.append("rejected cached lookup must unlock the retained candidate")
+    graph_put = function_body(q6apm, "q6apm_graph_put_ref")
+    if not ordered(
+        graph_put,
+        "mutex_lock(&graph->state_lock)",
+        "if (graph->cache_ref)",
+        "refcount_dec(&graph->refcount.refcount)",
+        "q6apm_queue_graph_release_locked(graph)",
+        "mutex_unlock(&graph->state_lock)",
+        "return;",
+    ):
+        errors.append("cached graph put must atomically hand off to its worker")
+    if "q6apm_maybe_queue_graph_release" in graph_put:
+        errors.append("cached graph put must not access graph after an unlocked kref drop")
+    queue_locked = function_body(q6apm, "q6apm_queue_graph_release_locked")
+    if "mutex_lock(" in queue_locked or not ordered(
+        queue_locked,
+        "lockdep_assert_held(&graph->state_lock)",
+        "graph->graph_release_work_queued = true",
+        "schedule_work(&graph->release_work)",
+    ):
+        errors.append("graph work claim and scheduling must share state_lock")
+
     return errors
 
 
@@ -1549,28 +1616,64 @@ class StreamModel:
 
 @dataclass
 class DrainNotifyModel:
+    """One live stream owner and at most one additional drain-work reference."""
+
     core_state: str = "running"
     trigger_holds_device_lock: bool = True
     pending: bool = False
-    delivered: bool = False
+    closing: bool = False
+    work: str = "idle"
+    refs: int = 1
+    delivered: int = 0
 
     def callback(self) -> None:
+        if self.closing:
+            return
         self.pending = True
+        if self.work == "idle":
+            self.refs += 1
+            self.work = "queued"
 
-    def worker(self) -> bool:
+    def start_worker(self) -> None:
+        assert self.work == "queued" and self.refs == 2
+        self.work = "running"
+
+    def retire_work(self) -> None:
+        assert self.work != "idle" and self.refs == 2
+        self.work = "idle"
+        self.refs -= 1
+
+    def worker(self, *, partial: bool = False) -> None:
+        assert self.work == "running"
+        if self.closing:
+            self.retire_work()
+            return
         if self.trigger_holds_device_lock:
-            return False
-        pending = self.pending
+            return
+        assert self.pending
+        if self.core_state != "draining":
+            self.work = "queued"  # retry keeps the same reference
+            return
         self.pending = False
-        if not pending or self.core_state != "draining":
-            return False
-        self.delivered = True
-        self.core_state = "setup"
-        return True
+        self.delivered += 1
+        self.core_state = "running" if partial else "setup"
+        self.retire_work()
 
     def trigger_returns(self) -> None:
         self.core_state = "draining"
         self.trigger_holds_device_lock = False
+
+    def join_work(self) -> bool:
+        assert self.closing
+        if self.work == "running":
+            return False  # cancel_sync waits for the worker to retire its claim
+        if self.work == "queued":
+            self.retire_work()  # cancel_sync removed pending work
+        return True
+
+    def release_owner(self) -> None:
+        assert self.closing and self.work == "idle" and self.refs == 1
+        self.refs -= 1
 
 
 @dataclass
@@ -1958,13 +2061,44 @@ def run_models() -> None:
     assert full.start() == 12
     assert full.in_flight == 12
 
+    # Two partial drains reuse the stream, then a full drain returns it to SETUP.
     notify = DrainNotifyModel()
-    notify.callback()
-    assert not notify.worker()
-    assert notify.pending and not notify.delivered
-    notify.trigger_returns()
-    assert notify.worker()
-    assert notify.delivered and notify.core_state == "setup"
+    for count, partial in enumerate((True, True, False), 1):
+        notify.trigger_holds_device_lock = True
+        notify.callback()
+        notify.callback()  # duplicate completion before delivery
+        assert notify.work == "queued" and notify.refs == 2
+        notify.start_worker()
+        notify.worker(partial=partial)
+        assert notify.pending and notify.delivered == count - 1
+        notify.trigger_returns()
+        notify.worker(partial=partial)
+        assert notify.delivered == count and not notify.pending
+        assert notify.core_state == ("running" if partial else "setup")
+        assert notify.work == "idle" and notify.refs == 1
+    notify.closing = True
+    assert notify.join_work()
+    notify.release_owner()
+    assert notify.refs == 0
+
+    for phase in ("queued", "retry", "running"):
+        closing = DrainNotifyModel(trigger_holds_device_lock=False)
+        closing.callback()
+        if phase != "queued":
+            closing.start_worker()
+            if phase == "retry":
+                closing.worker()
+                assert closing.pending and closing.work == "queued" and closing.refs == 2
+        closing.closing = True
+        closing.callback()  # free closes admission before joining
+        if phase == "running":
+            assert not closing.join_work()
+            closing.worker()
+        assert closing.join_work() and closing.join_work()
+        closing.callback()
+        assert closing.work == "idle" and closing.refs == 1 and closing.delivered == 0
+        closing.release_owner()
+        assert closing.refs == 0
 
     deferred = DeferredErrorModel()
     deferred.callback_error()
@@ -2001,6 +2135,19 @@ def mutate_function(source: str, name: str, old: str, new: str) -> str:
 
 def run_mutations(source: str, audioreach: str, q6apm: str) -> None:
     mutations = (
+        mutate_function(source, "q6apm_compr_queue_drain_work",
+                        " && !prtd->drain_work_queued", ""),
+        mutate_function(source, "q6apm_compr_queue_drain_work",
+                        "kref_get(&prtd->refcount);", ""),
+        mutate_function(source, "q6apm_compr_work_put", "*queued = false;", ""),
+        mutate_function(source, "q6apm_compr_cancel_drain_work", "if (cancelled)", "if (true)"),
+        mutate_function(source, "q6apm_compr_drain_work", "if (!rescheduled)", "if (true)"),
+        mutate_function(
+            source,
+            "q6apm_compr_drain_work",
+            "snd_compr_drain_notify(stream);\n\t\tq6apm_compr_work_put(prtd, &prtd->drain_work_queued);",
+            "snd_compr_drain_notify(stream);",
+        ),
         source.replace("\t.copy\t\t= q6apm_compr_copy,", "\t.ack\t\t= NULL,\n\t.copy\t\t= q6apm_compr_copy,", 1),
         source.replace("PAGE_ALIGN(ring_bytes)", "ring_bytes", 1),
         source.replace(
@@ -2459,6 +2606,32 @@ def run_mutations(source: str, audioreach: str, q6apm: str) -> None:
         if not verify(mutation, audioreach, q6apm):
             raise AssertionError(f"mutation {index} escaped the contract")
 
+    q6apm_mutations = (
+        mutate_function(
+            q6apm,
+            "q6apm_graph_get_ar_graph",
+            "available = !ar_graph->destroying &&\n\t\t\t\t!ar_graph->graph_quarantined &&\n\t\t\t\tkref_get_unless_zero(&ar_graph->refcount);\n\t\t\tmutex_unlock(&ar_graph->state_lock);\n\t\t\tif (!available)\n\t\t\t\tar_graph = NULL;",
+            "if (ar_graph->destroying || ar_graph->graph_quarantined ||\n\t\t\t    !kref_get_unless_zero(&ar_graph->refcount))\n\t\t\t\tar_graph = NULL;\n\t\t\tmutex_unlock(&ar_graph->state_lock);",
+        ),
+        mutate_function(
+            q6apm,
+            "q6apm_graph_put_ref",
+            "mutex_lock(&graph->state_lock);",
+            "/* unlocked cached reference drop */",
+        ),
+        mutate_function(
+            q6apm,
+            "q6apm_queue_graph_release_locked",
+            "lockdep_assert_held(&graph->state_lock);",
+            "/* missing state lock contract */",
+        ),
+    )
+    for index, mutation in enumerate(q6apm_mutations, 1):
+        if mutation == q6apm:
+            raise AssertionError(f"q6apm mutation {index} did not alter the source")
+        if not verify(source, audioreach, mutation):
+            raise AssertionError(f"q6apm mutation {index} escaped the contract")
+
     audioreach_mutations = (
         mutate_function(
             audioreach,
@@ -2753,15 +2926,76 @@ def run_mutations(source: str, audioreach: str, q6apm: str) -> None:
             raise AssertionError(f"q6apm mutation {index} escaped the contract")
 
 
+def verify_core_release(source: str) -> list[str]:
+    errors: list[str] = []
+    release = function_body(source, "snd_compr_free")
+    lock = "scoped_guard(mutex, &data->stream.device->lock)"
+    if not ordered(
+        release,
+        "cancel_delayed_work_sync(&data->stream.error_work)",
+        lock,
+        "switch (runtime->state)",
+        "data->stream.ops->trigger(&data->stream, SNDRV_PCM_TRIGGER_STOP)",
+        "snd_compr_task_free_all(&data->stream)",
+        "data->stream.ops->free(&data->stream)",
+    ):
+        errors.append("release STOP must hold the core mutex after joining error work")
+        return errors
+    start = release.index("{", release.index(lock) + len(lock))
+    depth = 0
+    end = None
+    for index in range(start, len(release)):
+        if release[index] == "{":
+            depth += 1
+        elif release[index] == "}":
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
+    if end is None:
+        errors.append("release STOP lock scope is unterminated")
+        return errors
+    locked = release[start:end]
+    if "ops->trigger" not in locked:
+        errors.append("release STOP escaped the core mutex scope")
+    if any(token in locked for token in
+           ("cancel_delayed_work_sync", "snd_compr_task_free_all", "ops->free")):
+        errors.append("release joins/free must stay outside the core mutex")
+    return errors
+
+
+def run_core_release_mutations(source: str) -> None:
+    mutations = (
+        mutate_function(
+            source, "snd_compr_free",
+            "scoped_guard(mutex, &data->stream.device->lock)", "if (true)",
+        ),
+        mutate_function(
+            source, "snd_compr_free", "switch (runtime->state) {",
+            "data->stream.ops->free(&data->stream);\n\t\tswitch (runtime->state) {",
+        ),
+        mutate_function(
+            source, "snd_compr_free", "switch (runtime->state) {",
+            "cancel_delayed_work_sync(&data->stream.error_work);\n"
+            "\t\tswitch (runtime->state) {",
+        ),
+    )
+    for index, mutation in enumerate(mutations, 1):
+        if mutation == source or not verify_core_release(mutation):
+            raise AssertionError(f"release core mutation {index} escaped the contract")
+
+
 def main() -> None:
     source = SOURCE.read_text(encoding="utf-8")
     audioreach = AUDIOREACH_SOURCE.read_text(encoding="utf-8")
     q6apm = Q6APM_SOURCE.read_text(encoding="utf-8")
-    errors = verify(source, audioreach, q6apm)
+    core = COMPRESS_CORE_SOURCE.read_text(encoding="utf-8")
+    errors = verify(source, audioreach, q6apm) + verify_core_release(core)
     if errors:
         raise SystemExit("\n".join(errors))
     run_models()
     run_mutations(source, audioreach, q6apm)
+    run_core_release_mutations(core)
     print("Q6APM_COMPRESS_CONTRACT=PASS")
 
 

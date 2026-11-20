@@ -43,34 +43,6 @@ static void q6apm_graph_put_ref(struct audioreach_graph *graph);
 static void q6apm_retire_port_commands(struct q6apm *apm, u64 graph_cookie,
 				       bool reset);
 
-static void q6apm_maybe_queue_graph_release(struct audioreach_graph *graph)
-{
-	struct q6apm *apm;
-	bool queue = false;
-
-	if (!graph)
-		return;
-	apm = graph->apm;
-	if (!apm)
-		return;
-
-	/*
-	 * The cache reference keeps the graph alive while the worker is queued.
-	 * The worker itself checks temporary refs and pending operations; queue on
-	 * every transition to a clientless cache so a later ref/operation drop can
-	 * retry even if the first worker exited before marking quarantine.
-	 */
-	mutex_lock(&apm->lock);
-	if (graph->cache_ref && !graph->destroying) {
-		mutex_lock(&graph->state_lock);
-		queue = !graph->clients;
-		mutex_unlock(&graph->state_lock);
-	}
-	mutex_unlock(&apm->lock);
-	if (queue)
-		q6apm_queue_graph_release(graph);
-}
-
 /*
  * Authenticate and pin the currently published APM while dispatching a
  * response.  APR quiesces new callbacks before the client remove callback;
@@ -748,6 +720,7 @@ static struct audioreach_graph *
 q6apm_graph_get_ar_graph(struct q6apm_graph *graph)
 {
 	struct audioreach_graph *ar_graph;
+	bool available;
 
 	if (!graph)
 		return NULL;
@@ -759,10 +732,12 @@ q6apm_graph_get_ar_graph(struct q6apm_graph *graph)
 		ar_graph = READ_ONCE(graph->ar_graph);
 		if (ar_graph) {
 			mutex_lock(&ar_graph->state_lock);
-			if (ar_graph->destroying || ar_graph->graph_quarantined ||
-			    !kref_get_unless_zero(&ar_graph->refcount))
-				ar_graph = NULL;
+			available = !ar_graph->destroying &&
+				!ar_graph->graph_quarantined &&
+				kref_get_unless_zero(&ar_graph->refcount);
 			mutex_unlock(&ar_graph->state_lock);
+			if (!available)
+				ar_graph = NULL;
 		}
 	}
 	mutex_unlock(&graph->lock);
@@ -965,7 +940,7 @@ EXPORT_SYMBOL_GPL(q6apm_send_cmd_sync_graph_port);
 
 static int audioreach_graph_mgmt_cmd(struct audioreach_graph *graph,
 				     uint32_t opcode);
-static void q6apm_destroy_audioreach_graph(struct audioreach_graph *graph);
+static bool q6apm_destroy_audioreach_graph(struct audioreach_graph *graph);
 static void q6apm_queue_graph_release(struct audioreach_graph *graph);
 
 static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
@@ -1223,7 +1198,7 @@ static bool q6apm_graph_has_ticket(struct audioreach_graph *graph)
  * reference is the final ownership barrier; all lookups are rejected once
  * @destroying is published under apm->lock.
  */
-static void q6apm_destroy_audioreach_graph(struct audioreach_graph *graph)
+static bool q6apm_destroy_audioreach_graph(struct audioreach_graph *graph)
 {
 	struct q6apm *apm;
 	u64 graph_cookie;
@@ -1231,9 +1206,9 @@ static void q6apm_destroy_audioreach_graph(struct audioreach_graph *graph)
 	bool can_destroy;
 
 	if (!graph || !graph->apm)
-		return;
+		return false;
 	if (q6apm_graph_has_ticket(graph))
-		return;
+		return false;
 
 	apm = graph->apm;
 	mutex_lock(&apm->lock);
@@ -1250,7 +1225,7 @@ static void q6apm_destroy_audioreach_graph(struct audioreach_graph *graph)
 	mutex_unlock(&graph->state_lock);
 	mutex_unlock(&apm->lock);
 	if (!removed)
-		return;
+		return false;
 
 	/*
 	 * No other reference can be acquired after @destroying is set and the
@@ -1269,28 +1244,29 @@ static void q6apm_destroy_audioreach_graph(struct audioreach_graph *graph)
 	wake_up_all(&apm->graph_wait);
 	/* The IDR/cache reference kept the parent alive. */
 	kref_put(&apm->refcount, q6apm_release);
+	return true;
+}
+
+static void q6apm_queue_graph_release_locked(struct audioreach_graph *graph)
+{
+	lockdep_assert_held(&graph->state_lock);
+	if (graph->destroying || graph->graph_release_work_queued)
+		return;
+
+	graph->graph_release_work_queued = true;
+	/* The state lock protects the work claim.  A running instance is never
+	 * executed concurrently; schedule_work() may coalesce a pending wakeup.
+	 */
+	schedule_work(&graph->release_work);
 }
 
 static void q6apm_queue_graph_release(struct audioreach_graph *graph)
 {
-	bool schedule = false;
-
 	if (!graph)
 		return;
 	mutex_lock(&graph->state_lock);
-	if (!graph->destroying && !graph->graph_release_work_queued) {
-		graph->graph_release_work_queued = true;
-		schedule = true;
-	}
+	q6apm_queue_graph_release_locked(graph);
 	mutex_unlock(&graph->state_lock);
-	if (schedule && !schedule_work(&graph->release_work)) {
-		mutex_lock(&graph->state_lock);
-		graph->graph_release_work_queued = false;
-		mutex_unlock(&graph->state_lock);
-	}
-	if (!schedule && graph->apm)
-		dev_dbg(graph->apm->dev,
-			"graph %u release work already queued\n", graph->id);
 }
 
 static void q6apm_graph_put_ref(struct audioreach_graph *graph)
@@ -1299,12 +1275,26 @@ static void q6apm_graph_put_ref(struct audioreach_graph *graph)
 		return;
 
 	/*
-	 * The cache reference keeps the object alive across a non-final drop.  Test
-	 * release eligibility after the decrement so the worker observes the new
-	 * refcount under state_lock and cannot strand the sole cache reference.
+	 * Keep the caller reference until the worker's eligibility lock is held.
+	 * A cached decrement is non-final: the worker owns destruction of the
+	 * final cache reference.  Drop and schedule atomically, then never access
+	 * the graph again after releasing state_lock.
 	 */
-	if (!kref_put(&graph->refcount, q6apm_put_audioreach_graph))
-		q6apm_maybe_queue_graph_release(graph);
+	mutex_lock(&graph->state_lock);
+	if (graph->cache_ref) {
+		if (WARN_ON_ONCE(graph->destroying ||
+				 refcount_read(&graph->refcount.refcount) < 2)) {
+			mutex_unlock(&graph->state_lock);
+			return;
+		}
+		refcount_dec(&graph->refcount.refcount);
+		if (!graph->clients)
+			q6apm_queue_graph_release_locked(graph);
+		mutex_unlock(&graph->state_lock);
+		return;
+	}
+	mutex_unlock(&graph->state_lock);
+	kref_put(&graph->refcount, q6apm_put_audioreach_graph);
 }
 
 static void q6apm_put_audioreach_graph(struct kref *ref)
@@ -1355,9 +1345,13 @@ static void q6apm_release_audioreach_graph_work(struct work_struct *work)
 		return;
 	}
 	if (destroy) {
-		graph->graph_release_work_queued = false;
 		mutex_unlock(&graph->state_lock);
-		q6apm_destroy_audioreach_graph(graph);
+		if (!q6apm_destroy_audioreach_graph(graph)) {
+			mutex_lock(&graph->state_lock);
+			if (!graph->destroying)
+				graph->graph_release_work_queued = false;
+			mutex_unlock(&graph->state_lock);
+		}
 		return;
 	}
 	graph->operation_pending = true;
@@ -1370,9 +1364,13 @@ static void q6apm_release_audioreach_graph_work(struct work_struct *work)
 		mutex_lock(&graph->state_lock);
 		graph->graph_close_confirmed = true;
 		graph->operation_pending = false;
-		graph->graph_release_work_queued = false;
 		mutex_unlock(&graph->state_lock);
-		q6apm_destroy_audioreach_graph(graph);
+		if (!q6apm_destroy_audioreach_graph(graph)) {
+			mutex_lock(&graph->state_lock);
+			if (!graph->destroying)
+				graph->graph_release_work_queued = false;
+			mutex_unlock(&graph->state_lock);
+		}
 	} else {
 		mutex_lock(&graph->state_lock);
 		graph->operation_pending = false;

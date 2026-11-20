@@ -149,14 +149,21 @@ static int snd_compr_free(struct inode *inode, struct file *f)
 
 	cancel_delayed_work_sync(&data->stream.error_work);
 
-	switch (runtime->state) {
-	case SNDRV_PCM_STATE_RUNNING:
-	case SNDRV_PCM_STATE_DRAINING:
-	case SNDRV_PCM_STATE_PAUSED:
-		data->stream.ops->trigger(&data->stream, SNDRV_PCM_TRIGGER_STOP);
-		break;
-	default:
-		break;
+	/* Preserve the ioctl trigger lock contract on the final close as well.
+	 * Drivers may synchronously publish XRUN from a failed STOP.  Keep both
+	 * work cancellation and driver free outside this lock: they may join
+	 * workers which acquire the same compressed-device mutex.
+	 */
+	scoped_guard(mutex, &data->stream.device->lock) {
+		switch (runtime->state) {
+		case SNDRV_PCM_STATE_RUNNING:
+		case SNDRV_PCM_STATE_DRAINING:
+		case SNDRV_PCM_STATE_PAUSED:
+			data->stream.ops->trigger(&data->stream, SNDRV_PCM_TRIGGER_STOP);
+			break;
+		default:
+			break;
+		}
 	}
 
 	snd_compr_task_free_all(&data->stream);

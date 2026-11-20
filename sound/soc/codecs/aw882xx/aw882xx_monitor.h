@@ -201,6 +201,9 @@ struct aw_monitor_desc {
 	struct aw_monitor_cfg monitor_cfg;
 
 	bool mon_start_flag;
+	/* Prevent a codec workqueue teardown from racing a monitor re-arm. */
+	bool queue_stopping;
+	bool queue_shutdown;
 	uint8_t first_entry;
 	uint8_t samp_count;
 	uint8_t db_offset;
@@ -222,6 +225,8 @@ struct aw_monitor_desc {
  *******************************************************************/
 void aw882xx_monitor_start(struct aw_monitor_desc *monitor_desc);
 int aw882xx_monitor_stop(struct aw_monitor_desc *monitor_desc);
+void aw882xx_monitor_suspend(struct aw_monitor_desc *monitor_desc);
+void aw882xx_monitor_resume(struct aw_monitor_desc *monitor_desc);
 int aw882xx_monitor_init(struct aw_monitor_desc *monitor_desc);
 void aw882xx_monitor_deinit(struct aw_monitor_desc *monitor_desc);
 int aw882xx_monitor_parse_fw(struct aw_monitor_desc *monitor_desc,

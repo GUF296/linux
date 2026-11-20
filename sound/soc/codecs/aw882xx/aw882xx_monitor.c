@@ -471,6 +471,7 @@ static void aw_monitor_work_func(struct work_struct *work)
 			monitor_cfg->monitor_switch);
 
 	if ((monitor_cfg->monitor_status == AW_MON_CFG_OK) && (aw_dev->monitor_start) &&
+		!monitor->queue_stopping && !monitor->queue_shutdown &&
 		monitor_cfg->monitor_switch) {
 		if (!aw_get_hmute(aw_dev)) {
 			aw_monitor_work(aw_dev);
@@ -512,29 +513,29 @@ void aw882xx_monitor_start(struct aw_monitor_desc *monitor_desc)
 	struct aw882xx *aw882xx = (struct aw882xx *)aw_dev->private_data;
 
 	aw_dev_info(aw_dev->dev, "enter");
-	if (monitor_desc->monitor_mode == AW_MON_KERNEL_MODE &&
-	    (!aw882xx || !aw882xx->work_queue)) {
+	mutex_lock(&monitor_desc->lock);
+	if (monitor_desc->queue_stopping || monitor_desc->queue_shutdown ||
+	    (monitor_desc->monitor_mode == AW_MON_KERNEL_MODE &&
+	     (!aw882xx || !aw882xx->work_queue))) {
+		mutex_unlock(&monitor_desc->lock);
 		aw_dev_err(aw_dev->dev, "monitor workqueue is unavailable");
 		return;
 	}
-
 	aw_monitor_check_bop_status(aw_dev);
-
 	if (aw_dev->bop_en == AW_BOP_ENABLE) {
+		mutex_unlock(&monitor_desc->lock);
 		aw_dev_info(aw_dev->dev, "bop status is enable, monitor can't start");
 		return;
 	}
-
-	mutex_lock(&monitor_desc->lock);
 	monitor_desc->first_entry = AW_FIRST_ENTRY;
 	monitor_desc->samp_count = 0;
 	monitor_desc->vol_trace.sum_val = 0;
 	monitor_desc->temp_trace.sum_val = 0;
 	monitor_desc->mon_start_flag = true;
-	mutex_unlock(&monitor_desc->lock);
 	if (monitor_desc->monitor_mode == AW_MON_KERNEL_MODE)
 		queue_delayed_work(aw882xx->work_queue,
 						&monitor_desc->delay_work, 0);
+	mutex_unlock(&monitor_desc->lock);
 }
 
 int aw882xx_monitor_stop(struct aw_monitor_desc *monitor_desc)
@@ -545,14 +546,50 @@ int aw882xx_monitor_stop(struct aw_monitor_desc *monitor_desc)
 	aw_dev_info(aw_dev->dev, "enter");
 	mutex_lock(&monitor_desc->lock);
 	aw_dev->volume_desc.monitor_volume = 0;
+	monitor_desc->queue_stopping = true;
 	monitor_desc->mon_start_flag = false;
 	mutex_unlock(&monitor_desc->lock);
 
 	if (monitor_desc->monitor_mode == AW_MON_KERNEL_MODE)
 		cancel_delayed_work_sync(&monitor_desc->delay_work);
 
+	mutex_lock(&monitor_desc->lock);
+	if (!monitor_desc->queue_shutdown)
+		monitor_desc->queue_stopping = false;
+	mutex_unlock(&monitor_desc->lock);
+
 
 	return 0;
+}
+
+void aw882xx_monitor_suspend(struct aw_monitor_desc *monitor_desc)
+{
+	struct aw_device *aw_dev;
+
+	if (!monitor_desc)
+		return;
+	aw_dev = container_of(monitor_desc, struct aw_device, monitor_desc);
+
+	mutex_lock(&monitor_desc->lock);
+	aw_dev->volume_desc.monitor_volume = 0;
+	monitor_desc->queue_stopping = true;
+	monitor_desc->queue_shutdown = true;
+	monitor_desc->mon_start_flag = false;
+	mutex_unlock(&monitor_desc->lock);
+
+	if (monitor_desc->monitor_mode == AW_MON_KERNEL_MODE)
+		cancel_delayed_work_sync(&monitor_desc->delay_work);
+}
+
+void aw882xx_monitor_resume(struct aw_monitor_desc *monitor_desc)
+{
+	if (!monitor_desc)
+		return;
+
+	mutex_lock(&monitor_desc->lock);
+	monitor_desc->queue_stopping = false;
+	monitor_desc->queue_shutdown = false;
+	mutex_unlock(&monitor_desc->lock);
 }
 
 void aw882xx_monitor_hal_work(struct aw_monitor_desc *monitor_desc, uint32_t *vmax)
@@ -1478,6 +1515,8 @@ int aw882xx_monitor_init(struct aw_monitor_desc *monitor_desc)
 
 
 	mutex_init(&monitor_desc->lock);
+	monitor_desc->queue_stopping = false;
+	monitor_desc->queue_shutdown = false;
 	aw_monitor_parse_mode(aw_dev);
 	INIT_DELAYED_WORK(&monitor_desc->delay_work, aw_monitor_work_func);
 
@@ -1496,7 +1535,7 @@ void aw882xx_monitor_deinit(struct aw_monitor_desc *monitor_desc)
 	struct aw_device *aw_dev =
 		container_of(monitor_desc, struct aw_device, monitor_desc);
 
-	aw882xx_monitor_stop(monitor_desc);
+	aw882xx_monitor_suspend(monitor_desc);
 
 	sysfs_remove_group(&aw_dev->dev->kobj, &aw_monitor_attr_group);
 	aw_monitor_free_firmware(aw_dev);

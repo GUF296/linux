@@ -1826,6 +1826,7 @@ static int aw882xx_codec_probe(aw_snd_soc_codec_t *aw_codec)
 		aw_dev_err(aw882xx->dev, "create workqueue failed !");
 		return -EINVAL;
 	}
+	aw882xx_monitor_resume(&aw882xx->aw_pa->monitor_desc);
 
 	INIT_DELAYED_WORK(&aw882xx->start_work, aw882xx_startup_work);
 	INIT_DELAYED_WORK(&aw882xx->interrupt_work, aw882xx_interrupt_work);
@@ -1851,6 +1852,8 @@ static int aw882xx_codec_probe(aw_snd_soc_codec_t *aw_codec)
 static void aw882xx_codec_cleanup(struct aw882xx *aw882xx)
 {
 	if (aw882xx->work_queue) {
+		/* Stop monitor producers before dismantling their shared queue. */
+		aw882xx_monitor_suspend(&aw882xx->aw_pa->monitor_desc);
 		cancel_delayed_work_sync(&aw882xx->fw_work);
 		cancel_delayed_work_sync(&aw882xx->start_work);
 		cancel_delayed_work_sync(&aw882xx->dc_work);

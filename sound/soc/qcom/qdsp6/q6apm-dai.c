@@ -1261,6 +1261,7 @@ static void q6apm_compr_drain_work(struct work_struct *work)
 	spin_unlock_irqrestore(&prtd->lock, flags);
 	if (notify) {
 		snd_compr_drain_notify(stream);
+		q6apm_compr_work_put(prtd, &prtd->drain_work_queued);
 	} else if (retry) {
 		rescheduled = false;
 		spin_lock_irqsave(&prtd->lock, flags);

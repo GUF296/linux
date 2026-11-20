@@ -1334,6 +1334,7 @@ return:
 *******************************************************/
 static int32_t nvt_ts_probe(struct spi_device *client)
 {
+	struct workqueue_struct *event_wq;
 	int32_t ret = 0;
 #if (TOUCH_KEY_NUM > 0)
 	int32_t retry = 0;
@@ -1455,7 +1456,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	if (drm_is_panel_follower(&client->dev)) {
 		int retry_count = 0;
 
-		while (!ts->panel_on) {
+		while (!READ_ONCE(ts->panel_on)) {
 			if (retry_count > 5) {
 				ret = -EPROBE_DEFER;
 				goto err_panelwait_failed;
@@ -1660,9 +1661,9 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 			msecs_to_jiffies(NVT_TOUCH_ESD_CHECK_PERIOD));
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 
-	ts->event_wq = alloc_workqueue("nvt-event-queue",
+	event_wq = alloc_workqueue("nvt-event-queue",
 		WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE, 1);
-	if (!ts->event_wq) {
+	if (!event_wq) {
 		NVT_ERR("Can not create work thread for suspend/resume!!");
 		ret = -ENOMEM;
 		goto err_alloc_work_thread_failed;
@@ -1675,7 +1676,8 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	ret = mi_drm_register_client(&ts->drm_notif);
 	if(ret) {
 		NVT_ERR("register drm_notifier failed. ret=%d\n", ret);
-		goto err_register_drm_notif_failed;
+		destroy_workqueue(event_wq);
+		goto err_alloc_work_thread_failed;
 	}
 	nvt_mi_notifier_registered = true;
 #endif
@@ -1687,25 +1689,18 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	nvt_irq_enable(true);
 	pm_relax(&client->dev);
 
+	/* The panel can change while probe is waiting for firmware or IRQ setup. */
+	mutex_lock(&ts->lock);
+	ts->event_wq = event_wq;
+#if defined(CONFIG_DRM_PANEL)
+	if (nvt_panel_follower_added && !ts->panel_on)
+		queue_work(event_wq, &ts->suspend_work);
+#endif
+	mutex_unlock(&ts->lock);
+
 	return 0;
 
-#if NVT_USE_MI_DRM_NOTIFIER
-err_register_drm_notif_failed:
-	if (nvt_mi_notifier_registered) {
-		if (mi_drm_unregister_client(&ts->drm_notif))
-			NVT_ERR("Error occurred while unregistering drm_notifier.\n");
-		nvt_mi_notifier_registered = false;
-	}
-#endif
-
 err_alloc_work_thread_failed:
-	if (ts->event_wq) {
-		cancel_work_sync(&ts->suspend_work);
-		cancel_work_sync(&ts->resume_work);
-		destroy_workqueue(ts->event_wq);
-		ts->event_wq = NULL;
-	}
-
 #if NVT_TOUCH_ESD_PROTECT
 	if (nvt_esd_check_wq) {
 		cancel_delayed_work_sync(&nvt_esd_check_work);
@@ -2100,6 +2095,7 @@ recovery_failed:
 static int nvt_drm_notifier_callback(struct notifier_block *self, unsigned long event, void *data)
 {
 	int blank;
+	struct workqueue_struct *event_wq;
 	struct nvt_ts_data *ts_data =
 		container_of(self, struct nvt_ts_data, drm_notif);
 
@@ -2107,18 +2103,21 @@ static int nvt_drm_notifier_callback(struct notifier_block *self, unsigned long 
 		return 0;
 
 	blank = *(enum drm_notifier_data *)data;
-	if (ts_data->event_wq) {
+	mutex_lock(&ts_data->lock);
+	event_wq = ts_data->event_wq;
+	mutex_unlock(&ts_data->lock);
+	if (event_wq) {
 		if (event == MI_DRM_EARLY_EVENT_BLANK) {
 			if (blank == MI_DRM_BLANK_POWERDOWN) {
 				NVT_LOG("event=%lu, *blank=%d\n", event, blank);
-				flush_workqueue(ts_data->event_wq);
-				queue_work(ts_data->event_wq, &ts_data->suspend_work);
+				flush_workqueue(event_wq);
+				queue_work(event_wq, &ts_data->suspend_work);
 			}
 		} else if (event == MI_DRM_EVENT_BLANK) {
 			if (blank == MI_DRM_BLANK_UNBLANK) {
 				NVT_LOG("event=%lu, *blank=%d\n", event, blank);
-				flush_workqueue(ts_data->event_wq);
-				queue_work(ts_data->event_wq, &ts_data->resume_work);
+				flush_workqueue(event_wq);
+				queue_work(event_wq, &ts_data->resume_work);
 			}
 		}
 	}
@@ -2169,18 +2168,27 @@ static const struct dev_pm_ops nvt_dev_pm_ops = {
 
 
 #if defined(CONFIG_DRM_PANEL)
+static struct workqueue_struct *nvt_record_panel_state(struct nvt_ts_data *ts,
+						      bool prepared)
+{
+	guard(mutex)(&ts->lock);
+	WRITE_ONCE(ts->panel_on, prepared);
+	return ts->event_wq;
+}
+
 static int nt36xxx_panel_prepared(struct drm_panel_follower *follower)
 {
 	struct nvt_ts_data *ts = container_of(follower, struct nvt_ts_data,
 					      panel_follower);
+	struct workqueue_struct *event_wq;
+
 	if (READ_ONCE(nvt_removing))
 		return -ENODEV;
 
-	ts->panel_on = true;
-
-	if (ts->event_wq) {
-		flush_workqueue(ts->event_wq);
-		queue_work(ts->event_wq, &ts->resume_work);
+	event_wq = nvt_record_panel_state(ts, true);
+	if (event_wq) {
+		flush_workqueue(event_wq);
+		queue_work(event_wq, &ts->resume_work);
 	}
 
 	return 0;
@@ -2190,14 +2198,16 @@ static int nt36xxx_panel_unpreparing(struct drm_panel_follower *follower)
 {
 	struct nvt_ts_data *ts = container_of(follower, struct nvt_ts_data,
 					      panel_follower);
+	struct workqueue_struct *event_wq;
+
 	if (READ_ONCE(nvt_removing))
 		return -ENODEV;
 
-	ts->panel_on = false;
+	event_wq = nvt_record_panel_state(ts, false);
+	if (!event_wq)
+		return 0;
 
-	if (ts->event_wq)
-		flush_workqueue(ts->event_wq);
-
+	flush_workqueue(event_wq);
 	return nvt_ts_suspend(&ts->client->dev);
 }
 
